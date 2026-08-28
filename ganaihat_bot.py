@@ -956,6 +956,7 @@ def init_db():
             "point_to_egp": "0.01",
             "egp_per_usd": "50",
             "ad_reward_cents": str(AD_REWARD),
+            "min_withdrawal_cents": str(WITHDRAWAL_MIN_POINTS),
         }.items():
             conn.execute(
                 "INSERT OR IGNORE INTO currency_settings "
@@ -1882,6 +1883,39 @@ def set_ad_reward(reward_cents: int) -> bool:
             "setting_value = excluded.setting_value, "
             "updated_at = CURRENT_TIMESTAMP",
             (str(reward_cents),),
+        )
+        conn.commit()
+    return True
+
+
+def get_min_withdrawal() -> int:
+    """يُعيد الحد الأدنى للسحب بالقروش من قاعدة البيانات."""
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT setting_value FROM currency_settings "
+                "WHERE setting_key = 'min_withdrawal_cents'"
+            ).fetchone()
+        if row is not None:
+            return max(1, int(row["setting_value"]))
+    except (sqlite3.Error, TypeError, ValueError):
+        pass
+    return WITHDRAWAL_MIN_POINTS
+
+
+def set_min_withdrawal(amount_cents: int) -> bool:
+    """يُحفظ الحد الأدنى للسحب بالقروش."""
+    if amount_cents < 1:
+        return False
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO currency_settings "
+            "(setting_key, setting_value, updated_at) "
+            "VALUES ('min_withdrawal_cents', ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(setting_key) DO UPDATE SET "
+            "setting_value = excluded.setting_value, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (str(amount_cents),),
         )
         conn.commit()
     return True
@@ -3724,6 +3758,10 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         "📺 إدارة إعلانات المشاهدة",
         callback_data="admin_watch_ads",
     ))
+    markup.add(InlineKeyboardButton(
+        "💰 تعديل الحد الأدنى للسحب",
+        callback_data="admin_set_min_withdrawal",
+    ))
     markup.add(InlineKeyboardButton("🔙 إغلاق اللوحة", callback_data="admin_close"))
     return markup
 
@@ -4496,11 +4534,11 @@ def handle_withdrawal_amount(message):
     raw_amount = (message.text or "").strip()
 
     amount_cents = parse_currency_input(raw_amount)
-    if amount_cents is None or amount_cents < WITHDRAWAL_MIN_CENTS:
+    if amount_cents is None or amount_cents < get_min_withdrawal():
         bot.send_message(
             message.chat.id,
             f"⚠️ أدخل مبلغاً صحيحاً لا يقل عن "
-            f"<b>{format_balance(WITHDRAWAL_MIN_CENTS)}</b>.",
+            f"<b>{format_balance(get_min_withdrawal())}</b>.",
         )
         return
 
@@ -5152,6 +5190,34 @@ def handle_ad_reward_input(message):
     )
 
 
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id)
+    and user_state.get(m.from_user.id, {}).get("step") == "awaiting_min_withdrawal"
+)
+def handle_min_withdrawal_input(message):
+    """يحفظ الحد الأدنى للسحب الجديد الذي يحدده المشرف."""
+    admin_id = message.from_user.id
+    amount = parse_currency_input(message.text or "")
+    if amount is None or amount < 1:
+        bot.send_message(
+            admin_id,
+            "⚠️ أرسل رقم صحيح أكبر من صفر، مثل 10 أو 25 أو 50.",
+        )
+        return
+
+    set_min_withdrawal(amount)
+    user_state.pop(admin_id, None)
+    bot.send_message(
+        admin_id,
+        "✅ <b>تم تحديث الحد الأدنى للسحب</b>\n\n"
+        f"الحد الأدنى الجديد: <b>{format_balance(amount)}</b>\n\n"
+        "سيتم تطبيقه فوراً على جميع طلبات السحب الجديدة.",
+        reply_markup=admin_keyboard(),
+    )
+
+
 @bot.message_handler(
     func=lambda m: is_admin(m.from_user.id)
     and user_state.get(m.from_user.id, {}).get("step")
@@ -5767,11 +5833,11 @@ def callback_withdraw_earnings(call):
         )
         return
 
-    if row_balance_cents(user) < WITHDRAWAL_MIN_CENTS:
+    if row_balance_cents(user) < get_min_withdrawal():
         bot.answer_callback_query(call.id)
         bot.edit_message_text(
             "عذراً، الحد الأدنى لسحب الأرباح هو "
-            f"{format_balance(WITHDRAWAL_MIN_CENTS)}. اجمع المزيد وحاول مجدداً! 🚀",
+            f"{format_balance(get_min_withdrawal())}. اجمع المزيد وحاول مجدداً! 🚀",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=InlineKeyboardMarkup([[
@@ -5788,7 +5854,7 @@ def callback_withdraw_earnings(call):
         f"💰 <b>سحب الأرباح</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"رصيدك الحالي: <b>{balance_text(user)}</b>\n"
-        f"الحد الأدنى للسحب: <b>{format_balance(WITHDRAWAL_MIN_CENTS)}</b>\n\n"
+        f"الحد الأدنى للسحب: <b>{format_balance(get_min_withdrawal())}</b>\n\n"
         "اختر طريقة السحب:",
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
@@ -5830,7 +5896,7 @@ def callback_withdrawal_method(call):
         f"✅ اخترت: <b>{method}</b>\n\n"
         f"أرسل الآن المبلغ الذي تريد سحبه بالجنيه أو الدولار، مثل "
         f"<code>12.35</code> أو <code>$0.50</code>.\n"
-        f"الحد الأدنى هو <b>{format_balance(WITHDRAWAL_MIN_CENTS)}</b>، "
+        f"الحد الأدنى هو <b>{format_balance(get_min_withdrawal())}</b>، "
         "ويجب ألا يتجاوز المبلغ رصيدك الحالي.\n\n"
         "<i>أرسل /start للإلغاء.</i>",
         chat_id=call.message.chat.id,
@@ -6259,6 +6325,40 @@ def callback_admin_set_ad_reward(call):
             InlineKeyboardButton(
                 "❌ إلغاء",
                 callback_data="admin_service_prices",
+            ),
+        ]]),
+    )
+    bot.answer_callback_query(call.id)
+
+
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_set_min_withdrawal"
+    and is_admin(call.from_user.id)
+)
+def callback_admin_set_min_withdrawal(call):
+    admin_id = call.from_user.id
+    current = get_min_withdrawal()
+    user_state[admin_id] = {"step": "awaiting_min_withdrawal"}
+    bot.edit_message_text(
+        "💰 <b>تعديل الحد الأدنى للسحب</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"الحد الأدنى الحالي: <b>{format_balance(current)}</b>\n\n"
+        "أرسل الحد الأدنى الجديد بالجنيه أو الدولار، مثل:\n"
+        "• <code>10</code>\n"
+        "• <code>25</code>\n"
+        "• <code>50</code>\n"
+        "• <code>100</code>\n"
+        "• <code>250</code>\n"
+        "• <code>1000</code>\n\n"
+        "⚠️ القيمة يجب أن تكون أكبر من صفر.",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "❌ إلغاء",
+                callback_data="admin_panel",
             ),
         ]]),
     )
