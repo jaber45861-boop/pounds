@@ -54,6 +54,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from telebot.types import BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from urllib.parse import parse_qs, urlsplit
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 from reward_api import register_reward_api
@@ -75,7 +76,7 @@ MONETAG_SDK_NAME = os.environ.get(
     f"show_{MONETAG_ZONE_ID}",
 ).strip()
 
-BOT_USERNAME    = "CoinCraftNet_bot"   # ← اسم مستخدم البوت
+BOT_USERNAME    = "GanaihatBot"         # ← اسم مستخدم البوت الجديد
 ADMIN_ID        = 6175354851           # ← معرّف حساب المشرف
 AD_REWARD       = 50
 ADVERTISING_URL = os.environ.get(
@@ -412,13 +413,179 @@ def service_display_name(service_key: str, service: dict | None = None) -> str:
 user_state: dict[int, dict] = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ─── نظام مكافحة البوتات (Anti-Bot Verification) ──────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+import random as _random
+
+ANTI_BOT_SESSION_TTL = 300  # 5 دقائق
+ANTI_BOT_MAX_ATTEMPTS = 3
+
+# جلسة التحقق المؤقتة: user_id → {answer, expires_at, attempts}
+anti_bot_sessions: dict[int, dict] = {}
+
+
+def _generate_math_challenge() -> tuple[str, int, list[int]]:
+    """يولّد عملية حسابية عشوائية ويعيد (السؤال, الإجابة الصحيحة, الخيارات)."""
+    op = _random.choice(["+", "-", "*"])
+    if op == "+":
+        a, b = _random.randint(2, 50), _random.randint(2, 50)
+        answer = a + b
+        symbol = "+"
+    elif op == "-":
+        a = _random.randint(10, 60)
+        b = _random.randint(2, a - 1)
+        answer = a - b
+        symbol = "-"
+    else:
+        a, b = _random.randint(2, 12), _random.randint(2, 12)
+        answer = a * b
+        symbol = "×"
+
+    question = f"{a} {symbol} {b}"
+
+    # توليد 3 إجابات خاطئة مختلفة
+    wrong_answers: set[int] = set()
+    while len(wrong_answers) < 3:
+        offset = _random.choice([-3, -2, -1, 1, 2, 3, 4, 5])
+        wrong = answer + offset
+        if wrong != answer and wrong > 0 and wrong not in wrong_answers:
+            wrong_answers.add(wrong)
+
+    options = [answer] + list(wrong_answers)
+    _random.shuffle(options)
+    return question, answer, options
+
+
+def start_anti_bot_verification(user_id: int) -> tuple[str, list[int]]:
+    """يبدأ جلسة تحقق جديدة ويعيد (السؤال, الخيارات)."""
+    question, answer, options = _generate_math_challenge()
+    anti_bot_sessions[user_id] = {
+        "answer": answer,
+        "expires_at": time.time() + ANTI_BOT_SESSION_TTL,
+        "attempts": 0,
+        "question": question,
+        "options": options,
+    }
+    return question, options
+
+
+def verify_anti_bot_answer(user_id: int, chosen: int) -> tuple[bool, str]:
+    """
+    يتحقق من إجابة المستخدم.
+    يعيد (نجاح, رسالة).
+    """
+    session = anti_bot_sessions.get(user_id)
+    if session is None:
+        return False, "expired"
+
+    if time.time() > session["expires_at"]:
+        del anti_bot_sessions[user_id]
+        return False, "expired"
+
+    session["attempts"] += 1
+
+    if chosen == session["answer"]:
+        del anti_bot_sessions[user_id]
+        return True, "correct"
+
+    if session["attempts"] >= ANTI_BOT_MAX_ATTEMPTS:
+        del anti_bot_sessions[user_id]
+        return False, "max_attempts"
+
+    return False, "wrong"
+
+
+def is_user_verified(user_id: int) -> bool:
+    """يتحقق هل المستخدم أتم التحقق بنجاح."""
+    user = get_user(user_id)
+    if user is None:
+        return False
+    return bool(user["is_verified"])
+
+
+def mark_user_verified(user_id: int):
+    """يُعلّم المستخدم كमتحقق منه."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET is_verified = 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+
+
+def build_verification_keyboard(options: list[int]) -> InlineKeyboardMarkup:
+    """يُنشئ أزرار الإجابات."""
+    markup = InlineKeyboardMarkup()
+    # صفوف من 2 أزرار
+    for i in range(0, len(options), 2):
+        row = []
+        for j in range(i, min(i + 2, len(options))):
+            row.append(InlineKeyboardButton(
+                str(options[j]),
+                callback_data=f"antibot_{options[j]}",
+            ))
+        markup.row(*row)
+    return markup
+
+
+def show_anti_bot_challenge(chat_id: int, user_id: int):
+    """يعرض اختبار مكافحة البوتات."""
+    question, options = start_anti_bot_verification(user_id)
+    text = (
+        "🤖 <b>للتحقق من أنك لست روبوتًا</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"احسب العملية التالية:\n\n"
+        f"🧮 <b>{question} = ؟</b>\n\n"
+        "اختر الإجابة الصحيحة:"
+    )
+    bot.send_message(
+        chat_id, text,
+        reply_markup=build_verification_keyboard(options),
+    )
+
+
+def require_verified_user(call_or_message) -> bool:
+    """
+    دالة حماية مركّزة.
+    تمنع الوصول إذا لم يكمل المستخدم التحقق.
+    تُعيد True إذا كان المستخدم متحققًا.
+    """
+    if hasattr(call_or_message, "from_user"):
+        uid = call_or_message.from_user.id
+    elif hasattr(call_or_message, "from_user"):
+        uid = call_or_message.from_user.id
+    else:
+        return True
+
+    if is_user_verified(uid):
+        return True
+
+    # المستخدم غير متحقق — يُمنع من الوصول
+    if hasattr(call_or_message, "id"):
+        # CallbackQuery
+        bot.answer_callback_query(
+            call_or_message.id,
+            "🤖 أكمل التحقق أولاً.",
+            show_alert=True,
+        )
+        chat_id = call_or_message.message.chat.id
+        msg_id = call_or_message.message.message_id
+    else:
+        chat_id = call_or_message.chat.id
+        msg_id = None
+
+    show_anti_bot_challenge(chat_id, uid)
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ─── قاعدة البيانات ───────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 # Use the uploaded database by default.  BOT_DB_PATH can be used by the
 # workflow to point at a different copy without changing the bot code.
 DB_PATH = os.environ.get(
     "BOT_DB_PATH",
-    str(Path(__file__).with_name("users_(3)_1785867154340.db")),
+    str(Path(__file__).with_name("ganaihat_fresh.db")),
 )
 
 
@@ -610,6 +777,11 @@ def init_db():
         if "balance_migrated_at" not in user_columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN balance_migrated_at DATETIME"
+            )
+        if "is_verified" not in user_columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN is_verified INTEGER "
+                "NOT NULL DEFAULT 0"
             )
         conn.execute(
             "UPDATE users SET balance_cents = points, "
@@ -3510,7 +3682,13 @@ def show_activation_gate(
 
 
 def require_active_account(call) -> bool:
-    """يمنع الوصول إلى واجهة المستخدم عند عدم تفعيل الحساب."""
+    """يمنع الوصول إلى واجهة المستخدم عند عدم إتمام التحقق أو عدم تفعيل الحساب."""
+    # أولاً: التحقق من مكافحة البوتات
+    if not is_user_verified(call.from_user.id):
+        show_anti_bot_challenge(call.message.chat.id, call.from_user.id)
+        bot.answer_callback_query(call.id, "🤖 أكمل التحقق أولاً.", show_alert=True)
+        return False
+    # ثانياً: تفعيل الحساب (اشتراك القنوات)
     if account_access_allowed(call.from_user.id):
         return True
     show_activation_gate(
@@ -3823,10 +4001,86 @@ def cmd_start(message):
     # مسح أي حالة سابقة للمحادثة
     user_state.pop(user.id, None)
 
+    # ─── فحص التحقق من م협حة البوتات ──────────────────────────────────────
+    if not is_user_verified(user.id):
+        show_anti_bot_challenge(message.chat.id, user.id)
+        return
     current_user = get_user(user.id)
     if current_user is not None and not account_access_allowed(user.id):
         show_activation_gate(message.chat.id, user.id)
         return
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── معالج إجابات مكافحة البوتات ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.callback_query_handler(func=lambda call: call.data.startswith("antibot_"))
+def callback_anti_bot(call):
+    user_id = call.from_user.id
+    try:
+        chosen = int(call.data[len("antibot_"):])
+    except ValueError:
+        bot.answer_callback_query(call.id, "خيارات غير صالحة.", show_alert=True)
+        return
+
+    success, result = verify_anti_bot_answer(user_id, chosen)
+
+    if result == "expired":
+        bot.answer_callback_query(call.id, "⏰ انتهت صلاحية الاختبار.", show_alert=True)
+        show_anti_bot_challenge(call.message.chat.id, user_id)
+        return
+
+    if success:
+        mark_user_verified(user_id)
+        bot.answer_callback_query(call.id, "✅ تحقّقت بنجاح!", show_alert=True)
+        # عرض القائمة الرئيسية
+        current_user = get_user(user_id)
+        greeting = (
+            f"👋 <b>أهلاً وسهلاً يا {call.from_user.first_name}!</b>\n\n"
+            "يسعدنا انضمامك إلينا. تم تسجيل حسابك بنجاح ✅\n\n"
+            "اختر أحد الخيارات أدناه للبدء:"
+        )
+        bot.edit_message_text(
+            greeting,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    # إجابة خاطئة
+    session = anti_bot_sessions.get(user_id)
+    if result == "max_attempts":
+        bot.answer_callback_query(
+            call.id,
+            "❌ استنفدتم المحاولات. جرّب مجدداً.",
+            show_alert=True,
+        )
+        # إنشاء اختبار جديد
+        show_anti_bot_challenge(call.message.chat.id, user_id)
+    else:
+        remaining = ANTI_BOT_MAX_ATTEMPTS - (session["attempts"] if session else 0)
+        bot.answer_callback_query(
+            call.id,
+            f"❌ إجابة خاطئة. متبقي {remaining} محاولات.",
+            show_alert=True,
+        )
+        # عرض الاختبار مجدداً مع نفس السؤال
+        session_data = anti_bot_sessions.get(user_id, {}); question = session_data.get("question", "?")
+        options = session_data.get("options", [])
+        if not options:
+            question, options = start_anti_bot_verification(user_id)
+        bot.edit_message_text(
+            f"🤖 <b>للتحقق من أنك لست روبوتًا</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"احسب العملية التالية:\n\n"
+            f"🧮 <b>{question} = ؟</b>\n\n"
+            f"اختر الإجابة الصحيحة:\n"
+            f"(متبقي {remaining} محاولات)",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=build_verification_keyboard(options),
+        )
 
     greeting = (
         f"👋 <b>أهلاً وسهلاً يا {user.first_name}!</b>\n\n"
@@ -5332,6 +5586,8 @@ def handle_user_ad_price(message):
 # ══════════════════════════════════════════════════════════════════════════════
 @bot.callback_query_handler(func=lambda call: call.data == "publish_user_ad")
 def callback_publish_user_ad(call):
+    if not require_active_account(call):
+        return
     user_id = call.from_user.id
     state = user_state.get(user_id, {})
     if state.get("step") != "awaiting_user_ad_publish":
@@ -6672,6 +6928,8 @@ def callback_daily_tasks(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("check_channel_"))
 def callback_check_channel(call):
     """يتحقق من اشتراك المستخدم في قناة محددة ويمنحه مكافأتها فوراً."""
+    if not require_active_account(call):
+        return
     user_id  = call.from_user.id
     task_key = call.data[len("check_channel_"):]
 
@@ -6875,6 +7133,8 @@ def callback_approve_referral_claim(call):
     func=lambda call: call.data.startswith("reject_referral_claim_")
 )
 def callback_reject_referral_claim(call):
+    if not require_active_account(call):
+        return
     try:
         claim_id = int(call.data[len("reject_referral_claim_"):])
     except ValueError:
@@ -6923,6 +7183,8 @@ def callback_reject_referral_claim(call):
     func=lambda call: call.data.startswith("complaint_referral_")
 )
 def callback_start_referral_complaint(call):
+    if not require_active_account(call):
+        return
     try:
         claim_id = int(call.data[len("complaint_referral_"):])
     except ValueError:
@@ -7052,6 +7314,8 @@ def callback_reject_referral_complaint(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("open_manual_"))
 def callback_open_manual(call):
+    if not require_active_account(call):
+        return
     user_id = call.from_user.id
     if get_user(user_id) is None:
         bot.answer_callback_query(
@@ -7143,6 +7407,8 @@ def callback_open_manual(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_manual_"))
 def callback_cancel_manual_task(call):
     """يلغي حالة تنفيذ المهمة الحالية دون حذف المهمة أو بياناتها."""
+    if not require_active_account(call):
+        return
     user_id = call.from_user.id
     if get_user(user_id) is None:
         bot.answer_callback_query(call.id, "يرجى إرسال /start أولاً.", show_alert=True)
@@ -7186,6 +7452,8 @@ def callback_cancel_manual_task(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("claim_manual_"))
 def callback_claim_manual(call):
+    if not require_active_account(call):
+        return
     user_id = call.from_user.id
     if get_user(user_id) is None:
         bot.answer_callback_query(call.id, "يرجى إرسال /start أولاً.", show_alert=True)
@@ -7272,6 +7540,8 @@ def callback_claim_manual(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "verify_activation")
 def callback_verify_activation(call):
+    if not require_active_account(call):
+        return
     user_id = call.from_user.id
     if get_user(user_id) is None:
         bot.answer_callback_query(
@@ -7675,12 +7945,8 @@ def callback_back_main(call):
 # ─── تشغيل البوت ──────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 def run_bot():
-    """Initialize the existing database and start Telegram polling once."""
-    if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(
-            f"قاعدة البيانات غير موجودة: {DB_PATH}. "
-            "تحقق من BOT_DB_PATH أو ارفع ملف قاعدة البيانات."
-        )
+    """Initialize a fresh database and start Telegram polling once."""
+    # قاعدة بيانات جديدة بالكامل — لا يوجد أي اتصال بالقاعدة القديمة
     init_db()
     register_reward_api(
         app,
