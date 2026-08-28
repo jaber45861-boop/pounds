@@ -4048,6 +4048,13 @@ def cmd_start(message):
         show_activation_gate(message.chat.id, user.id)
         return
 
+    # ─── عرض القائمة الرئيسية ─────────────────────────────────────────────
+    greeting = (
+        f"🌟 <b>مرحباً يا {user.first_name}!</b>\n\n"
+        "اختر أحد الخيارات أدناه:"
+    )
+    bot.send_message(message.chat.id, greeting, reply_markup=main_keyboard())
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ─── معالج إجابات مكافحة البوتات ─────────────────────────────────────────────
