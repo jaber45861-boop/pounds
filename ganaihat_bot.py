@@ -3401,7 +3401,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
         ))
     markup.row(
         InlineKeyboardButton("👤 الملف الشخصي", callback_data="profile"),
-        InlineKeyboardButton("🎯 كسب النقاط",   callback_data="earn_points"),
+        InlineKeyboardButton("🎯 شارك الرابط واربح",   callback_data="earn_points"),
     )
     markup.add(InlineKeyboardButton(
         "📣 تثبيت إعلان / روّج لقناتك",
