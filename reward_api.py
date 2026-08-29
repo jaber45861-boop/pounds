@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
+import requests as http_requests
 from flask import Flask, jsonify, request
 
 logger = logging.getLogger("telegram_reward_api")
@@ -177,8 +178,22 @@ def register_reward_api(
     allowed_origins: str,
     provider_webhook_secret: str = "",
     user_profit_pct: float = 0.70,
+    smmcpan_api_key: str = "",
+    smmcpan_api_url: str = "https://smmcpan.com/api/v2",
+    smm_margin_pct: float = 30.0,
+    egp_per_usd: float = 50.0,
 ):
     """Register Flask routes for the Mini App reward API."""
+
+    # Normalize SMMCPAN URL once at startup
+    _raw = smmcpan_api_url.rstrip("/")
+    if not _raw.endswith("/api/v2"):
+        if _raw.endswith("/api"):
+            smmcpan_api_url = _raw + "/v2"
+        else:
+            smmcpan_api_url = _raw + "/api/v2"
+    else:
+        smmcpan_api_url = _raw
 
     CORS_ORIGINS = allowed_origins or "*"
 
@@ -341,6 +356,76 @@ def register_reward_api(
             return jsonify({"status": "error", "message": "Internal database error"}), 500
 
         return jsonify(result), 200
+
+    # ─── SMMCPAN Services Sync ──────────────────────────────────────────
+    @app.route("/tasks/sync", methods=["GET"])
+    def api_tasks_sync():
+        """Fetch social-media services from SMMCPAN and return them
+        with prices in cents (balance_cents system) and a dynamic margin."""
+        # Protect with API_SECRET
+        if api_secret:
+            provided = request.headers.get("X-API-Secret", "") or request.args.get("token", "")
+            if not hmac.compare_digest(provided, api_secret):
+                return jsonify({"error": "invalid_secret"}), 403
+
+        if not smmcpan_api_key:
+            return jsonify({"status": "error", "message": "SMMCPAN API key not configured"}), 500
+
+        try:
+            resp = http_requests.post(
+                smmcpan_api_url,
+                data={"key": smmcpan_api_key, "action": "services"},
+                timeout=20,
+            )
+            services = resp.json()
+        except Exception as exc:
+            logger.error("SMMCPAN services fetch failed: %s", exc)
+            return jsonify({"status": "error", "message": "Failed to connect to SMMCPAN"}), 502
+
+        if not isinstance(services, list):
+            return jsonify({"status": "error", "message": "Invalid response from SMMCPAN", "raw": services}), 502
+
+        margin = smm_margin_pct / 100.0  # e.g. 30 → 0.30
+
+        filtered = []
+        for svc in services:
+            name = (svc.get("name") or "").lower()
+            category = (svc.get("category") or "").lower()
+            # Keep social-media services: telegram, instagram, facebook, tiktok, twitter
+            if not any(kw in category or kw in name
+                       for kw in ("telegram", "instagram", "facebook",
+                                  "tiktok", "twitter", "subscriber",
+                                  "follow", "view", "like")):
+                continue
+
+            # Assumption: SMMCPAN rate is USD per 1000 units, following standard SMM panel convention.
+            # Verify against provider documentation/support before production pricing.
+            rate_usd = float(svc.get("rate", 0))
+            cost_per_1k_egp = rate_usd * egp_per_usd
+            cost_per_unit_egp = cost_per_1k_egp / 1000.0
+            # Apply margin: selling price = cost / (1 - margin)
+            sell_price_egp = cost_per_unit_egp / (1 - margin) if margin < 1 else cost_per_unit_egp
+            # Convert to cents for the balance_cents system
+            sell_price_cents = int(round(sell_price_egp * 100))
+
+            filtered.append({
+                "service_id": svc.get("service"),
+                "name": svc.get("name"),
+                "category": svc.get("category"),
+                "min_quantity": svc.get("min"),
+                "max_quantity": svc.get("max"),
+                "rate_per_1k_usd": rate_usd,
+                "sell_price_cents": sell_price_cents,
+                "sell_price_egp": round(sell_price_egp, 2),
+            })
+
+        return jsonify({
+            "status": "success",
+            "tasks_count": len(filtered),
+            "margin_pct": smm_margin_pct,
+            "tasks": filtered,
+        })
+
 
     @app.route("/api/rewards/session", methods=["POST"])
     def api_session():

@@ -97,6 +97,21 @@ SMM_API_URL = os.environ.get(
     "https://justanotherpanel.com/api/v2",
 ).strip()  # ← رابط API لسيرفر JAP
 SMM_API_KEY = os.environ.get("SMM_API_KEY", "")      # ← يُقرأ من المتغيرات السرية
+
+# ─── إعدادات SMMCPAN (مورد خدمات السوشيال ميديا) ──────────────────────────────
+SMMCPAN_API_KEY  = os.environ.get("SMMCPAN_API_KEY", "")
+SMMCPAN_API_URL  = os.environ.get("SMMCPAN_API_URL", "https://smmcpan.com/api/v2").strip()
+# Normalize: strip trailing slash, ensure /api/v2 suffix, prevent duplication
+if SMMCPAN_API_URL.endswith("/"): SMMCPAN_API_URL = SMMCPAN_API_URL.rstrip("/")
+if not SMMCPAN_API_URL.endswith("/api/v2"):
+    if SMMCPAN_API_URL.endswith("/api"):
+        SMMCPAN_API_URL += "/v2"
+    elif SMMCPAN_API_URL.endswith("/api/v2/"):
+        SMMCPAN_API_URL = SMMCPAN_API_URL.rstrip("/")
+    else:
+        SMMCPAN_API_URL += "/api/v2"
+SMM_MARGIN_PCT   = float(os.environ.get("SMM_MARGIN_PCT", "30"))
+EGP_PER_USD_SMM  = float(os.environ.get("EGP_PER_USD_SMM", str(float(EGP_PER_USD))))
 REFERRAL_SERVICE_KEY = "referral_boost"
 REFERRAL_COST = 500
 REFERRAL_QUANTITY = 25
@@ -8086,6 +8101,10 @@ def run_bot():
         allowed_origins=REWARD_API_ORIGINS,
         provider_webhook_secret=PROVIDER_WEBHOOK_SECRET,
         user_profit_pct=USER_PROFIT_PCT,
+        smmcpan_api_key=SMMCPAN_API_KEY,
+        smmcpan_api_url=SMMCPAN_API_URL,
+        smm_margin_pct=SMM_MARGIN_PCT,
+        egp_per_usd=EGP_PER_USD_SMM,
     )
     if not API_SECRET:
         logging.getLogger("telegram_reward_api").warning(
