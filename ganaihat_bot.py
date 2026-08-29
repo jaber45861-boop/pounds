@@ -69,6 +69,13 @@ API_SECRET = os.environ.get("API_SECRET", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "")
 REWARD_API_ORIGINS = os.environ.get("REWARD_API_ORIGINS", "*")
 MONETAG_ZONE_ID = os.environ.get("MONETAG_ZONE_ID", "11487222")
+PROVIDER_WEBHOOK_SECRET = os.environ.get("PROVIDER_WEBHOOK_SECRET", "")
+_raw_pct = float(os.environ.get("USER_PROFIT_PERCENTAGE", 70))
+if not (0 <= _raw_pct <= 100):
+    raise ValueError(
+        f"USER_PROFIT_PERCENTAGE must be between 0 and 100, got {_raw_pct}"
+    )
+USER_PROFIT_PCT = _raw_pct / 100.0
 TELEGRAM_MINI_APP_URL = os.environ.get("TELEGRAM_MINI_APP_URL", "").strip()
 MONETAG_SDK_URL = os.environ.get("MONETAG_SDK_URL", "https://libtl.com/sdk.js").strip()
 MONETAG_SDK_NAME = os.environ.get(
@@ -1279,6 +1286,16 @@ def init_db():
                     package["points_cost"],
                 ),
             )
+        # ─── جدول منع تكرار المعاملات (Idempotency) ──────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_transactions (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key    TEXT    NOT NULL UNIQUE,
+                user_id            INTEGER NOT NULL,
+                amount_cents       INTEGER NOT NULL,
+                processed_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
     refresh_promotion_packages()
     refresh_required_channels()
@@ -8067,6 +8084,8 @@ def run_bot():
         db_path=DB_PATH,
         monetag_zone_id=MONETAG_ZONE_ID,
         allowed_origins=REWARD_API_ORIGINS,
+        provider_webhook_secret=PROVIDER_WEBHOOK_SECRET,
+        user_profit_pct=USER_PROFIT_PCT,
     )
     if not API_SECRET:
         logging.getLogger("telegram_reward_api").warning(
