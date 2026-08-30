@@ -16,6 +16,8 @@ import os
 import re
 import sqlite3
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import parse_qs, urlsplit
@@ -182,6 +184,9 @@ def register_reward_api(
     smmcpan_api_url: str = "https://smmcpan.com/api/v2",
     smm_margin_pct: float = 30.0,
     egp_per_usd: float = 50.0,
+    cpagrip_user_id: str = "",
+    cpagrip_key: str = "",
+    cpagrip_rss_url: str = "https://www.cpagrip.com/common/offer_feed_rss.php",
 ):
     """Register Flask routes for the Mini App reward API."""
 
@@ -452,6 +457,141 @@ def register_reward_api(
             "user_id": user_id,
             "session_token": session_token,
         })
+
+
+    # ─── CPAGrip Offer Feed ────────────────────────────────────────────────
+    @app.route("/api/cpagrip/offers", methods=["GET"])
+    def api_cpagrip_offers():
+        """Fetch CPA offers from CPAGrip RSS feed for a specific user.
+
+        Query params:
+          - user_id (required): Telegram user ID
+          - limit (optional): max offers to return, default 5
+
+        Returns offers with tracking_id appended to offerlink.
+        No balance is modified — read-only.
+        """
+        if api_secret:
+            provided = request.headers.get("X-API-Secret", "") or request.args.get("token", "")
+            if not hmac.compare_digest(provided, api_secret):
+                return jsonify({"error": "invalid_secret"}), 403
+
+        if not cpagrip_user_id or not cpagrip_key:
+            return jsonify({"status": "error", "message": "CPAGrip credentials not configured"}), 500
+
+        # Get user_id from query param (the Telegram user requesting offers)
+        try:
+            tg_user_id = int(request.args.get("user_id", 0))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Invalid user_id"}), 400
+
+        if not tg_user_id:
+            return jsonify({"status": "error", "message": "user_id is required"}), 400
+
+        limit = min(int(request.args.get("limit", 5)), 20)
+
+        # Fetch RSS feed from CPAGrip
+        try:
+            params = {
+                "user_id": cpagrip_user_id,
+                "key": cpagrip_key,
+                "limit": str(limit + 5),  # fetch extra to filter
+            }
+            resp = http_requests.get(cpagrip_rss_url, params=params, timeout=20)
+            if resp.status_code != 200:
+                logger.warning("CPAGrip RSS returned HTTP %d", resp.status_code)
+                return jsonify({"status": "error", "message": "Provider returned HTTP error"}), 502
+        except http_requests.RequestException as exc:
+            logger.error("CPAGrip RSS connection failed: %s", exc)
+            return jsonify({"status": "error", "message": "Connection to provider failed"}), 502
+
+        # Parse XML
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError as exc:
+            logger.error("CPAGrip RSS XML parse error: %s", exc)
+            return jsonify({"status": "error", "message": "Invalid XML from provider"}), 502
+
+        conn = get_connection()
+        offers = []
+        for item in root.findall(".//item"):
+            if len(offers) >= limit:
+                break
+
+            offer_id_el = item.find("offer_id")
+            title_el = item.find("title")
+            payout_el = item.find("payout")
+            offerlink_el = item.find("offerlink")
+            category_el = item.find("category")
+
+            if offerlink_el is None or offerlink_el.text is None:
+                continue
+
+            offer_id = (offer_id_el.text or "").strip() if offer_id_el is not None else ""
+            title = (title_el.text or "").strip() if title_el is not None else ""
+            payout_raw = (payout_el.text or "").strip() if payout_el is not None else ""
+            offerlink_base = (offerlink_el.text or "").strip()
+            category = (category_el.text or "").strip() if category_el is not None else ""
+
+            if not offer_id or not offerlink_base:
+                continue
+
+            # Generate unique tracking_id per user/offer combination (UUID, not user_id)
+            tracking_id = uuid.uuid4().hex
+
+            # Append tracking_id to offerlink
+            separator = "&" if "?" in offerlink_base else "?"
+            offerlink_with_tracking = f"{offerlink_base}{separator}tracking_id={tracking_id}"
+
+            # Persist mapping in DB
+            try:
+                with conn:
+                    cursor = conn.cursor()
+                    # Verify user exists
+                    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (tg_user_id,))
+                    if not cursor.fetchone():
+                        continue  # skip, don't create orphaned records
+
+                    cursor.execute(
+                        "INSERT INTO cpagrip_offers "
+                        "(user_id, offer_id, tracking_id, title, payout_raw, offerlink, status) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                        (tg_user_id, offer_id, tracking_id, title, payout_raw, offerlink_with_tracking),
+                    )
+            except sqlite3.IntegrityError:
+                # tracking_id collision (extremely unlikely with uuid4) — skip
+                continue
+            except sqlite3.Error as exc:
+                logger.error("CPAGrip offers DB error: %s", exc)
+                continue
+
+            offers.append({
+                "offer_id": offer_id,
+                "title": title,
+                "payout_raw": payout_raw,
+                "category": category,
+                "offerlink": offerlink_with_tracking,
+                "tracking_id": tracking_id,
+            })
+
+        return jsonify({
+            "status": "success",
+            "offers_count": len(offers),
+            "offers": offers,
+        })
+
+    # ─── CPAGrip Lead Checker (TODO: needs real response format) ───────────
+    @app.route("/api/cpagrip/verify", methods=["GET"])
+    def api_cpagrip_verify():
+        """Placeholder for CPAGrip Lead Checker verification.
+
+        TODO: Implement after obtaining real Lead Checker response format.
+        Currently returns a 501 to signal it's not yet implemented.
+        """
+        return jsonify({
+            "status": "not_implemented",
+            "message": "Lead Checker integration pending real response format",
+        }), 501
 
     def _authenticate_user():
         """Extract user_id from session cookie or header."""

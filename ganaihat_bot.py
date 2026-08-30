@@ -55,6 +55,8 @@ from pathlib import Path
 from telebot.types import BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from urllib.parse import parse_qs, urlsplit
 import time
+import uuid
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(__file__))
 from reward_api import register_reward_api
@@ -112,6 +114,12 @@ if not SMMCPAN_API_URL.endswith("/api/v2"):
         SMMCPAN_API_URL += "/api/v2"
 SMM_MARGIN_PCT   = float(os.environ.get("SMM_MARGIN_PCT", "30"))
 EGP_PER_USD_SMM  = float(os.environ.get("EGP_PER_USD_SMM", str(float(EGP_PER_USD))))
+
+# ─── إعدادات CPAGrip (مهام CPA) ────────────────────────────────────────────────
+CPAGRIP_USER_ID         = os.environ.get("CPAGRIP_USER_ID", "")
+CPAGRIP_KEY             = os.environ.get("CPAGRIP_KEY", "")
+CPAGRIP_RSS_URL         = "https://www.cpagrip.com/common/offer_feed_rss.php"
+
 REFERRAL_SERVICE_KEY = "referral_boost"
 REFERRAL_COST = 500
 REFERRAL_QUANTITY = 25
@@ -1301,6 +1309,23 @@ def init_db():
                     package["points_cost"],
                 ),
             )
+
+        # ─── جدول عروض CPAGrip ─────────────────────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cpagrip_offers (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL REFERENCES users(user_id),
+                offer_id        TEXT    NOT NULL,
+                tracking_id     TEXT    NOT NULL UNIQUE,
+                title           TEXT,
+                payout_raw      TEXT,
+                offerlink       TEXT    NOT NULL,
+                status          TEXT    NOT NULL DEFAULT 'pending',
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at    DATETIME
+            )
+        """)
+        
         # ─── جدول منع تكرار المعاملات (Idempotency) ──────────────────────────
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_transactions (
@@ -3849,10 +3874,113 @@ def build_shop_text(balance_cents: int) -> str:
     return "\n".join(lines)
 
 
+
+def fetch_cpagrip_offers_for_user(user_id: int, limit: int = 5) -> list[dict]:
+    """Fetch CPA offers from CPAGrip RSS for a specific user.
+
+    - Fetches XML from CPAGrip RSS Offer Feed.
+    - Generates a unique tracking_id (UUID4) per offer.
+    - Appends &tracking_id= to offerlink.
+    - Saves mapping to cpagrip_offers table.
+    - Returns list of offer dicts (read-only, no balance changes).
+    """
+    if not CPAGRIP_USER_ID or not CPAGRIP_KEY:
+        return []
+
+    try:
+        params = {
+            "user_id": CPAGRIP_USER_ID,
+            "key": CPAGRIP_KEY,
+            "limit": str(limit + 5),
+        }
+        resp = http.get(CPAGRIP_RSS_URL, params=params, timeout=20)
+        if resp.status_code != 200:
+            logging.getLogger("telegram_reward_api").warning(
+                "CPAGrip RSS returned HTTP %d", resp.status_code
+            )
+            return []
+    except Exception as exc:
+        logging.getLogger("telegram_reward_api").error(
+            "CPAGrip RSS failed: %s", exc
+        )
+        return []
+
+    try:
+        root = ET.fromstring(resp.text)
+    except ET.ParseError:
+        return []
+
+    offers = []
+    with get_connection() as conn:
+        for item in root.findall(".//item"):
+            if len(offers) >= limit:
+                break
+
+            offer_id_el = item.find("offer_id")
+            title_el = item.find("title")
+            payout_el = item.find("payout")
+            offerlink_el = item.find("offerlink")
+            category_el = item.find("category")
+            description_el = item.find("description")
+
+            if offerlink_el is None or offerlink_el.text is None:
+                continue
+
+            offer_id = (offer_id_el.text or "").strip() if offer_id_el is not None else ""
+            title = (title_el.text or "").strip() if title_el is not None else ""
+            payout_raw = (payout_el.text or "").strip() if payout_el is not None else ""
+            offerlink_base = (offerlink_el.text or "").strip()
+            category = (category_el.text or "").strip() if category_el is not None else ""
+            description = (description_el.text or "").strip() if description_el is not None else ""
+
+            if not offer_id or not offerlink_base:
+                continue
+
+            # Generate unique tracking_id (UUID4 — not guessable, no user_id leak)
+            tracking_id = uuid.uuid4().hex
+
+            # Append tracking_id to offerlink (verified: CPAGrip accepts this)
+            separator = "&" if "?" in offerlink_base else "?"
+            offerlink_with_tracking = f"{offerlink_base}{separator}tracking_id={tracking_id}"
+
+            # Persist mapping in DB (atomic within this connection)
+            try:
+                cursor = conn.cursor()
+                # Verify user exists before inserting
+                cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+                if not cursor.fetchone():
+                    continue
+
+                cursor.execute(
+                    "INSERT INTO cpagrip_offers "
+                    "(user_id, offer_id, tracking_id, title, payout_raw, offerlink, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                    (user_id, offer_id, tracking_id, title, payout_raw, offerlink_with_tracking),
+                )
+            except sqlite3.IntegrityError:
+                # Extremely unlikely UUID4 collision — skip
+                continue
+            except sqlite3.Error:
+                continue
+
+            offers.append({
+                "offer_id": offer_id,
+                "title": title,
+                "payout_raw": payout_raw,
+                "category": category,
+                "description": description[:120] if description else "",
+                "offerlink": offerlink_with_tracking,
+                "tracking_id": tracking_id,
+            })
+
+    return offers
+
+
 def build_tasks_text(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     channels       = get_channels_status(user_id)
     referral_tasks = get_active_referral_tasks(user_id)
     manual_tasks   = get_active_manual_tasks()
+    cpagrip_offers = fetch_cpagrip_offers_for_user(user_id, limit=5)
 
     text = (
         "📋 <b>المهام اليومية</b>\n"
@@ -3900,6 +4028,24 @@ def build_tasks_text(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 f"📊 المتبقي: <b>{task['quantity_remaining']}</b> تنفيذ\n\n"
             )
 
+    # ─── عروض CPAGrip (مهام CPA) ─────────────────────────────────────────
+    if cpagrip_offers:
+        text += (
+            "\n\n🎯 <b>عروض CPA المتاحة</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "نفّذ العرض واكسب المكافأة المحددة:\n\n"
+        )
+        for i, offer in enumerate(cpagrip_offers, 1):
+            desc_line = ""
+            if offer["description"]:
+                desc_line = f"    📝 {html.escape(offer['description'])}\n"
+            text += (
+                f"  {i}. <b>{html.escape(offer['title'])}</b>\n"
+                f"    💰 المكافأة: <b>${html.escape(offer['payout_raw'])}</b>\n"
+                f"{desc_line}"
+            )
+        text += "\n<i>💡 اضغط على الزر لفتح العرض ثم نفّذ الشروط المطلوبة.</i>"
+
     markup = InlineKeyboardMarkup()
     for task_group, keyboard_builder in (
         (referral_tasks, referral_tasks_keyboard),
@@ -3911,6 +4057,12 @@ def build_tasks_text(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 markup.keyboard.append(row)
     for row in tasks_keyboard(channels).keyboard:
         markup.keyboard.append(row)
+    # ─── أزرار عروض CPAGrip (فتح الرابط مباشرة) ──────────────────────────
+    for offer in cpagrip_offers:
+        markup.add(InlineKeyboardButton(
+            f"🎯 {html.escape(offer['title'])} — ${html.escape(offer['payout_raw'])}",
+            url=offer["offerlink"],
+        ))
     return text, markup
 
 
@@ -8105,6 +8257,9 @@ def run_bot():
         smmcpan_api_url=SMMCPAN_API_URL,
         smm_margin_pct=SMM_MARGIN_PCT,
         egp_per_usd=EGP_PER_USD_SMM,
+        cpagrip_user_id=CPAGRIP_USER_ID,
+        cpagrip_key=CPAGRIP_KEY,
+        cpagrip_rss_url=CPAGRIP_RSS_URL,
     )
     if not API_SECRET:
         logging.getLogger("telegram_reward_api").warning(
