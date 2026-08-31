@@ -585,12 +585,43 @@ def register_reward_api(
     def api_cpagrip_verify():
         """Placeholder for CPAGrip Lead Checker verification.
 
-        TODO: Implement after obtaining real Lead Checker response format.
-        Currently returns a 501 to signal it's not yet implemented.
+        IMPORTANT: CPAGrip uses a postback URL system (not a public API).
+        To complete integration, the following is required from CPAGrip:
+
+        1. POSTBACK URL configured in CPAGrip dashboard at:
+           https://www.cpagrip.com/admin/panels_tools_gpostback.php
+
+        2. POSTBACK TOKENS: CPAGrip replaces tokens in the URL with actual values.
+           Documented third-party tokens include:
+           - {tracking_id} : Unique click ID (maps to cpagrip_offers.tracking_id)
+           - {payout}      : Amount earned in USD
+           - {offer_id}    : ID of the completed offer
+           - {ip}          : User IP address
+           - {subid_1}     : Sub ID
+
+        3. EXAMPLE POSTBACK URL:
+           https://your-domain.com/api/cpagrip/verify?tracking_id={tracking_id}&payout={payout}&offer_id={offer_id}
+
+        4. WHAT IS NEEDED TO IMPLEMENT:
+           - A real CPAGrip account with postback configured
+           - Sample postback request from CPAGrip Postback Logs
+           - Confirmation of token names and any signature/hash mechanism
+
+        Currently returns 501 to signal the contract is not yet verified.
+        DO NOT implement fake verification or grant rewards without verified contract.
         """
         return jsonify({
-            "status": "not_implemented",
-            "message": "Lead Checker integration pending real response format",
+            "status": "provider_contract_unavailable",
+            "message": "CPAGrip Lead Checker integration requires verified postback contract",
+            "required_action": "Provide CPAGrip postback documentation or sample request",
+            "cpagrip_postback_url": "https://www.cpagrip.com/admin/panels_tools_gpostback.php",
+            "documented_tokens": [
+                "tracking_id",
+                "payout",
+                "offer_id",
+                "ip",
+                "subid_1",
+            ],
         }), 501
 
     def _authenticate_user():
