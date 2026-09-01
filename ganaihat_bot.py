@@ -113,7 +113,8 @@ if not SMMCPAN_API_URL.endswith("/api/v2"):
     else:
         SMMCPAN_API_URL += "/api/v2"
 SMM_MARGIN_PCT   = float(os.environ.get("SMM_MARGIN_PCT", "30"))
-EGP_PER_USD_SMM  = float(os.environ.get("EGP_PER_USD_SMM", str(float(EGP_PER_USD))))
+EGP_PER_USD_SMM  = float(os.environ.get("EGP_PER_USD_SMM", "50"))
+MARGIN_MULTIPLIER = Decimal("1.30")
 
 # ─── إعدادات CPAGrip (مهام CPA) ────────────────────────────────────────────────
 CPAGRIP_USER_ID         = os.environ.get("CPAGRIP_USER_ID", "")
@@ -1880,8 +1881,32 @@ def deduct_points(user_id: int, amount: int) -> bool:
         return cur.rowcount == 1
 
 
+def calculate_selling_price(base_cost: int) -> int:
+    """يحسب سعر البيع للعميل من التكلفة الأساسية بعد إضافة هامش الربح."""
+    if base_cost <= 0:
+        return 0
+    return int((Decimal(str(base_cost)) * MARGIN_MULTIPLIER).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
 def get_service_price(service_key: str) -> int:
-    """يعيد سعر الخدمة الحالي بالقروش."""
+    """يعيد سعر البيع الحالي للعميل بالقروش (التكلفة الأساسية + هامش 30%)."""
+    base_cost = 0
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT price_cents, price_points FROM service_price_settings "
+            "WHERE service_key = ?",
+            (service_key,),
+        ).fetchone()
+    if row is None:
+        service = SERVICE_INDEX.get(service_key)
+        base_cost = int(service["cost"]) if service else DEFAULT_ORDER_MIN_POINTS
+    else:
+        base_cost = int(row["price_cents"] or row["price_points"])
+    return calculate_selling_price(base_cost)
+
+
+def get_service_base_cost(service_key: str) -> int:
+    """يعيد التكلفة الأساسية للخدمة بدون هامش ربح."""
     with get_connection() as conn:
         row = conn.execute(
             "SELECT price_cents, price_points FROM service_price_settings "
@@ -3830,10 +3855,11 @@ def service_prices_keyboard() -> InlineKeyboardMarkup:
         callback_data="admin_set_ad_reward",
     ))
     for service_key, service in SERVICE_INDEX.items():
+        selling = get_service_price(service_key)
         markup.add(InlineKeyboardButton(
             f"{service['emoji']} {service_display_name(service_key, service)} — "
             f"{get_service_quantity(service_key)} وحدة / "
-            f"{format_balance(get_service_price(service_key))}",
+            f"{format_balance(selling)}",
             callback_data=f"admin_service_settings_{service_key}",
         ))
     markup.add(InlineKeyboardButton(
@@ -5279,11 +5305,14 @@ def handle_service_price_input(message):
 
     set_service_price(service_key, price)
     user_state.pop(admin_id, None)
+    selling = calculate_selling_price(price)
     bot.send_message(
         admin_id,
         "✅ <b>تم تحديث سعر الخدمة بنجاح</b>\n\n"
         f"الخدمة: <b>{html.escape(service_display_name(service_key, service))}</b>\n"
-        f"السعر الجديد: <b>{format_balance(price)}</b>",
+        f"📌 التكلفة الأساسية: <b>{format_balance(price)}</b>\n"
+        f"💰 سعر البيع للعميل: <b>{format_balance(selling)}</b>\n"
+        f"📊 هامش المنصة: <b>{int((MARGIN_MULTIPLIER - 1) * 100)}%</b>",
         reply_markup=admin_keyboard(),
     )
 
@@ -6620,8 +6649,10 @@ def callback_admin_service_settings(call):
         "⚙️ <b>إعدادات الخدمة</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"الخدمة: <b>{html.escape(service_display_name(service_key, service))}</b>\n"
-        f"السعر الحالي: <b>{format_balance(get_service_price(service_key))}</b>\n"
-        f"الكمية الحالية: <b>{get_service_quantity(service_key)} وحدة</b>\n\n"
+        f"📌 التكلفة الأساسية: <b>{format_balance(get_service_base_cost(service_key))}</b>\n"
+        f"💰 سعر البيع (العميل): <b>{format_balance(get_service_price(service_key))}</b>\n"
+        f"📊 هامش المنصة: <b>{int((MARGIN_MULTIPLIER - 1) * 100)}%</b>\n"
+        f"🔢 الكمية الحالية: <b>{get_service_quantity(service_key)} وحدة</b>\n\n"
         "اختر الإعداد الذي تريد تغييره.",
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
