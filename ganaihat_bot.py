@@ -113,7 +113,7 @@ if not SMMCPAN_API_URL.endswith("/api/v2"):
     else:
         SMMCPAN_API_URL += "/api/v2"
 SMM_MARGIN_PCT   = float(os.environ.get("SMM_MARGIN_PCT", "30"))
-EGP_PER_USD_SMM  = float(os.environ.get("EGP_PER_USD_SMM", "50"))
+EGP_PER_USD_SMM  = float(os.environ.get("EGP_PER_USD_SMM", str(float(EGP_PER_USD))))
 MARGIN_MULTIPLIER = Decimal("1.30")
 
 # ─── إعدادات CPAGrip (مهام CPA) ────────────────────────────────────────────────

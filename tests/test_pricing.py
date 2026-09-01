@@ -5,33 +5,41 @@ import tempfile
 import unittest
 from decimal import Decimal, ROUND_HALF_UP
 
-# Set required env vars before importing ganaihat_bot
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "1:TEST")
 os.environ.setdefault("API_SECRET", "")
 os.environ.setdefault("SESSION_SECRET", "")
 os.environ.setdefault("EGP_PER_USD_SMM", "50")
 
 sys.path.insert(0, "/root/pounds")
-from ganaihat_bot import (
-    calculate_selling_price,
-    MARGIN_MULTIPLIER,
-    parse_currency_input,
-    format_balance,
-    get_service_price,
-    get_service_base_cost,
-    set_service_price,
-    SERVICE_INDEX,
-    init_db,
-    get_connection,
+
+import decimal as _decimal
+import importlib.util
+import sys as _sys
+
+_spec = importlib.util.spec_from_file_location(
+    "ganaihat_bot",
+    "/root/pounds/ganaihat_bot.py",
+    submodule_search_locations=[],
 )
+_mod = importlib.util.module_from_spec(_spec)
+_mod.EGP_PER_USD = _decimal.Decimal("50")
+_spec.loader.exec_module(_mod)
+_sys.modules["ganaihat_bot"] = _mod
+
+calculate_selling_price = _mod.calculate_selling_price
+MARGIN_MULTIPLIER = _mod.MARGIN_MULTIPLIER
+parse_currency_input = _mod.parse_currency_input
+format_balance = _mod.format_balance
+get_service_price = _mod.get_service_price
+get_service_base_cost = _mod.get_service_base_cost
+set_service_price = _mod.set_service_price
+SERVICE_INDEX = _mod.SERVICE_INDEX
+init_db = _mod.init_db
 
 
 class TestPricingMargin(unittest.TestCase):
-    """اختبارات نظام هامش البيع 30%."""
-
     @classmethod
     def setUpClass(cls):
-        # Create temporary database for testing
         cls._db_fd, cls.DB_PATH = tempfile.mkstemp(suffix=".db")
         os.environ["BOT_DB_PATH"] = cls.DB_PATH
         init_db()
@@ -43,35 +51,30 @@ class TestPricingMargin(unittest.TestCase):
     def test_margin_constant(self):
         self.assertEqual(MARGIN_MULTIPLIER, Decimal("1.30"))
 
-    def test_calculate_selling_price_10_pounds(self):
-        # 10 جنيه = 1000 cents → 1300 cents = 13 جنيه
+    def test_selling_price_10_pounds(self):
         self.assertEqual(calculate_selling_price(1000), 1300)
 
-    def test_calculate_selling_price_50_pounds(self):
-        # 50 جنيه = 5000 cents → 6500 cents = 65 جنيه
+    def test_selling_price_50_pounds(self):
         self.assertEqual(calculate_selling_price(5000), 6500)
 
-    def test_calculate_selling_price_100_pounds(self):
-        # 100 جنيه = 10000 cents → 13000 cents = 130 جنيه
+    def test_selling_price_100_pounds(self):
         self.assertEqual(calculate_selling_price(10000), 13000)
 
-    def test_calculate_selling_price_33_pounds(self):
-        # 33 جنيه = 3300 cents → 4290 cents = 42.90 جنيه
+    def test_selling_price_33_pounds(self):
         self.assertEqual(calculate_selling_price(3300), 4290)
 
-    def test_calculate_selling_price_10_50_pounds(self):
-        # 10.50 جنيه = 1050 cents → 1365 cents = 13.65 جنيه
+    def test_selling_price_10_50_pounds(self):
         self.assertEqual(calculate_selling_price(1050), 1365)
 
-    def test_calculate_selling_price_0(self):
+    def test_selling_price_zero(self):
         self.assertEqual(calculate_selling_price(0), 0)
 
-    def test_calculate_selling_price_rounding(self):
+    def test_selling_price_rounding(self):
         self.assertEqual(calculate_selling_price(1), 1)
         self.assertEqual(calculate_selling_price(2), 3)
         self.assertEqual(calculate_selling_price(3), 4)
 
-    def test_calculate_selling_price_consistency(self):
+    def test_selling_price_consistency(self):
         for base in [1000, 5000, 10000, 3300, 1050]:
             selling = calculate_selling_price(base)
             self.assertGreaterEqual(selling, base)
@@ -85,8 +88,7 @@ class TestPricingMargin(unittest.TestCase):
                     ),
                 )
 
-    def test_admin_input_50_pounds_flow(self):
-        # Admin enters "50" meaning 50 جنيه
+    def test_admin_input_flow_50_pounds(self):
         base_cents = parse_currency_input("50")
         self.assertEqual(base_cents, 5000)
         selling_cents = calculate_selling_price(base_cents)
@@ -95,7 +97,6 @@ class TestPricingMargin(unittest.TestCase):
         self.assertIn("65.00", display)
 
     def test_set_service_price_stores_base_cost(self):
-        # Admin sets base cost to 50 جنيه (5000 cents)
         service_key = "tg_100"
         set_service_price(service_key, 5000)
         base = get_service_base_cost(service_key)
@@ -103,8 +104,7 @@ class TestPricingMargin(unittest.TestCase):
         self.assertEqual(base, 5000)
         self.assertEqual(selling, 6500)
 
-    def test_customer_privacy_no_base_cost(self):
-        # Verify customer-facing get_service_price returns selling price only
+    def test_customer_facing_price_is_selling_price_not_base(self):
         service_key = "tg_100"
         set_service_price(service_key, 5000)
         selling = get_service_price(service_key)
@@ -112,16 +112,14 @@ class TestPricingMargin(unittest.TestCase):
         self.assertEqual(selling, 6500)
         self.assertNotEqual(selling, base)
 
-    def test_customer_privacy_no_margin_exposure(self):
-        # Verify no customer-facing function leaks margin info
+    def test_customer_facing_price_does_not_expose_margin(self):
         service_key = "tg_100"
         set_service_price(service_key, 5000)
         selling = get_service_price(service_key)
         self.assertEqual(selling, calculate_selling_price(5000))
         self.assertNotEqual(selling, 5000)
 
-    def test_admin_can_see_base_and_selling(self):
-        # Admin messages CAN show base cost and margin
+    def test_admin_messages_can_show_base_and_margin(self):
         admin_text = (
             "📌 التكلفة الأساسية: 0.50 جنيه\n"
             "💰 سعر البيع: 0.65 جنيه\n"
