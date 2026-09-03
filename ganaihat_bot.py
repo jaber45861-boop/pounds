@@ -57,6 +57,7 @@ from urllib.parse import parse_qs, urlsplit
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 from reward_api import register_reward_api
@@ -1238,6 +1239,36 @@ def init_db():
         conn.execute(
             "UPDATE withdrawal_requests SET amount_cents = points_amount "
             "WHERE amount_cents IS NULL"
+        )
+        # V2 withdrawal fields (USDT-based accounting)
+        for col_sql in [
+            "ALTER TABLE withdrawal_requests ADD COLUMN method_code TEXT",
+            "ALTER TABLE withdrawal_requests ADD COLUMN network_code TEXT",
+            "ALTER TABLE withdrawal_requests ADD COLUMN destination TEXT",
+            "ALTER TABLE withdrawal_requests ADD COLUMN requested_egp_cents INTEGER",
+            "ALTER TABLE withdrawal_requests ADD COLUMN usdt_micro INTEGER",
+            "ALTER TABLE withdrawal_requests ADD COLUMN egp_equivalent_cents INTEGER",
+            "ALTER TABLE withdrawal_requests ADD COLUMN exchange_rate_micro INTEGER",
+            "ALTER TABLE withdrawal_requests ADD COLUMN rate_fetched_at TEXT",
+            "ALTER TABLE withdrawal_requests ADD COLUMN rate_provider TEXT",
+            "ALTER TABLE withdrawal_requests ADD COLUMN fee_cents INTEGER DEFAULT 0",
+            "ALTER TABLE withdrawal_requests ADD COLUMN refunded INTEGER DEFAULT 0",
+            "ALTER TABLE withdrawal_requests ADD COLUMN admin_id INTEGER",
+            "ALTER TABLE withdrawal_requests ADD COLUMN transaction_reference TEXT",
+        ]:
+            col_name = col_sql.split("ADD COLUMN ")[1].split(" ")[0]
+            if col_name not in withdrawal_columns:
+                conn.execute(col_sql)
+        # Backfill amount_cents for legacy rows lacking method_code
+        conn.execute(
+            "UPDATE withdrawal_requests SET method_code = 'legacy' "
+            "WHERE method_code IS NULL"
+        )
+        conn.execute(
+            "UPDATE withdrawal_requests SET refunded = 0 WHERE refunded IS NULL"
+        )
+        conn.execute(
+            "UPDATE withdrawal_requests SET fee_cents = 0 WHERE fee_cents IS NULL"
         )
         # الحملات المدفوعة التي تضيف قناة المعلن إلى شروط التفعيل.
         conn.execute("""
@@ -3163,6 +3194,13 @@ def create_withdrawal_request(
     withdrawal_method: str,
     account_details: str,
 ) -> int | str | None:
+    """Legacy create path. Customer flow is locked to V2.
+
+    Refuses non-admin callers to prevent bypass. Kept for admin use only
+    and for backwards compatibility with existing rows / admin tooling.
+    """
+    if not is_admin(user_id):
+        return "customer_legacy_disabled"
     """يخصم النقاط وينشئ الطلب مع تطبيق حد طلب واحد كل 24 ساعة."""
     referral_check = run_referral_withdrawal_double_check(user_id)
     if referral_check["blocked"]:
@@ -3278,6 +3316,536 @@ def cancel_withdrawal_and_refund(request_id: int):
             (row["amount_cents"] or row["points_amount"], row["user_id"]),
         )
         return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── V2 WITHDRAWAL SYSTEM (USDT accounting) ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Internal accounting unit: USDT (6 decimal places → micro-USDT = 10^-6 USDT)
+# Display unit: EGP (2 decimal places → cents)
+# Reference rate is the current USDT/EGP rate, fetched from an external source.
+
+WITHDRAWAL_METHOD_VODAFONE = "vodafone"
+WITHDRAWAL_METHOD_USDT = "usdt"
+WITHDRAWAL_NETWORK_BEP20 = "BSC_BEP20"
+WITHDRAWAL_NETWORK_DISPLAY = "BNB Smart Chain (BEP-20)"
+
+USDT_MICRO_PER_USDT = Decimal("1000000")
+EGP_CENTS_PER_EGP = Decimal("100")
+
+VODAFONE_MIN_EGP_CENTS = 1000  # 10.00 EGP
+USDT_MIN_USDT = Decimal("0.15")
+
+WITHDRAWAL_COOLDOWN_SECONDS = 24 * 60 * 60  # 24 hours
+MAX_RATE_AGE_SECONDS = 6 * 60 * 60  # 6 hours
+
+# Rate provider abstraction. Default uses CoinGecko's public API
+# (no API key required). Override via env or code.
+DEFAULT_RATE_PROVIDER = os.environ.get(
+    "WITHDRAWAL_RATE_PROVIDER", "coingecko"
+)
+
+
+def _usdt_to_micro(amount: Decimal) -> int:
+    return int(amount.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP) * USDT_MICRO_PER_USDT)
+
+
+def _micro_to_usdt(micro: int) -> Decimal:
+    return (Decimal(micro) / USDT_MICRO_PER_USDT).quantize(
+        Decimal("0.000001"), rounding=ROUND_HALF_UP
+    )
+
+
+def _egp_cents_to_egp(cents: int) -> Decimal:
+    return (Decimal(cents) / EGP_CENTS_PER_EGP).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+
+
+def _egp_to_egp_cents(amount: Decimal) -> int:
+    return int(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) * EGP_CENTS_PER_EGP)
+
+
+def fetch_usdt_egp_rate(provider: str = DEFAULT_RATE_PROVIDER) -> tuple[Decimal, str]:
+    """Fetch current USDT/EGP rate from the configured provider.
+
+    Returns (rate, provider_name). Rate is Decimal EGP per 1 USDT.
+    Raises RuntimeError on failure. Never returns silently.
+    """
+    if provider == "coingecko":
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {"ids": "tether", "vs_currencies": "egp"}
+        resp = http.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        rate = data.get("tether", {}).get("egp")
+        if rate is None:
+            raise RuntimeError("coingecko_missing_field")
+        return Decimal(str(rate)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP), "coingecko"
+    raise RuntimeError(f"unknown_rate_provider:{provider}")
+
+
+def _get_last_valid_rate() -> tuple[Decimal, str, str] | None:
+    """Returns (rate, provider, fetched_at_iso) of last successful rate snapshot,
+    or None if no valid rate has ever been recorded."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT setting_value FROM currency_settings "
+            "WHERE setting_key = 'usdt_egp_rate'"
+        ).fetchone()
+        provider_row = conn.execute(
+            "SELECT setting_value FROM currency_settings "
+            "WHERE setting_key = 'usdt_egp_rate_provider'"
+        ).fetchone()
+        ts_row = conn.execute(
+            "SELECT setting_value FROM currency_settings "
+            "WHERE setting_key = 'usdt_egp_rate_fetched_at'"
+        ).fetchone()
+    if not row or not row["setting_value"]:
+        return None
+    try:
+        return (
+            Decimal(row["setting_value"]),
+            provider_row["setting_value"] if provider_row else "unknown",
+            ts_row["setting_value"] if ts_row else "",
+        )
+    except (InvalidOperation, TypeError):
+        return None
+
+
+def _save_rate_snapshot(rate: Decimal, provider: str) -> None:
+    """Persist current rate to DB for fallback usage."""
+    now = datetime.utcnow().isoformat() + "Z"
+    with get_connection() as conn:
+        for key, value in [
+            ("usdt_egp_rate", str(rate)),
+            ("usdt_egp_rate_provider", provider),
+            ("usdt_egp_rate_fetched_at", now),
+        ]:
+            conn.execute(
+                "INSERT INTO currency_settings (setting_key, setting_value, updated_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(setting_key) DO UPDATE SET "
+                "setting_value = excluded.setting_value, updated_at = CURRENT_TIMESTAMP",
+                (key, value),
+            )
+        conn.commit()
+
+
+def get_current_usdt_egp_rate(allow_stale: bool = False) -> tuple[Decimal, str, bool]:
+    """Return (rate, provider, is_fresh).
+
+    If a fresh external fetch succeeds: returns live rate and saves snapshot.
+    If external fails and allow_stale=False: raises RuntimeError.
+    If external fails and allow_stale=True: returns last known rate with is_fresh=False.
+    If no prior rate exists: raises RuntimeError.
+    """
+    last = _get_last_valid_rate()
+    try:
+        rate, provider = fetch_usdt_egp_rate()
+        _save_rate_snapshot(rate, provider)
+        return rate, provider, True
+    except Exception as exc:
+        if last is None:
+            raise RuntimeError(f"no_rate_available:{exc}") from exc
+        if not allow_stale:
+            raise
+        return last[0], last[1], False
+
+
+def is_rate_within_max_age(fetched_at_iso: str) -> bool:
+    """Check if a stored rate timestamp is within the maximum acceptable age."""
+    if not fetched_at_iso:
+        return False
+    try:
+        ts = datetime.fromisoformat(fetched_at_iso.replace("Z", ""))
+    except (ValueError, TypeError):
+        return False
+    age = (datetime.utcnow() - ts).total_seconds()
+    return 0 <= age <= MAX_RATE_AGE_SECONDS
+
+
+def validate_vodafone_destination(destination: str) -> bool:
+    """Validate a Vodafone Cash mobile number.
+
+    Accepts Egyptian mobile numbers in 01x format (10-11 digits).
+    """
+    if not destination:
+        return False
+    cleaned = destination.replace(" ", "").replace("-", "").replace("+", "")
+    if not cleaned.isdigit():
+        return False
+    # Egyptian mobile: 01[0-9]{9} (11 digits) or 1[0-9]{9} (10 digits without leading 0)
+    if len(cleaned) == 11 and cleaned.startswith("01"):
+        return True
+    if len(cleaned) == 10 and cleaned.startswith("1"):
+        return True
+    return False
+
+
+def validate_usdt_bep20_address(address: str) -> bool:
+    """Validate a BEP-20 (BSC) wallet address.
+
+    A valid address is 42 characters, starts with '0x', and contains only
+    hexadecimal characters. This is a basic format check; on-chain verification
+    is out of scope.
+    """
+    if not address:
+        return False
+    address = address.strip()
+    if not address.startswith("0x"):
+        return False
+    if len(address) != 42:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in address[2:])
+
+
+def egp_to_usdt(egp_cents: int, rate: Decimal) -> Decimal:
+    """Convert EGP cents to USDT using the given rate (EGP per 1 USDT)."""
+    egp = Decimal(egp_cents) / EGP_CENTS_PER_EGP
+    if rate <= 0:
+        raise ValueError("rate_must_be_positive")
+    return (egp / rate).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+def usdt_to_egp_cents(usdt_amount: Decimal, rate: Decimal) -> int:
+    """Convert USDT amount to EGP cents using the given rate."""
+    if rate <= 0:
+        raise ValueError("rate_must_be_positive")
+    egp = (usdt_amount * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return int(egp * EGP_CENTS_PER_EGP)
+
+
+def get_withdrawal_cooldown_remaining(user_id: int) -> int:
+    """Returns seconds until next allowed withdrawal, or 0 if available."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT MAX(created_at) AS last_at FROM withdrawal_requests "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row or not row["last_at"]:
+        return 0
+    last_at_str = row["last_at"]
+    try:
+        # Parse SQLite UTC timestamp
+        last_at = datetime.strptime(last_at_str, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return 0
+    elapsed = (datetime.utcnow() - last_at).total_seconds()
+    remaining = int(WITHDRAWAL_COOLDOWN_SECONDS - elapsed)
+    return max(0, remaining)
+
+
+def format_cooldown_remaining(seconds: int) -> str:
+    """Format a seconds count into 'X ساعة Y دقيقة' for customer display."""
+    if seconds <= 0:
+        return "0 دقيقة"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours} ساعة")
+    if minutes > 0 or hours == 0:
+        parts.append(f"{minutes} دقيقة")
+    return " و".join(parts)
+
+
+def create_v2_withdrawal_request(
+    user_id: int,
+    method_code: str,
+    destination: str,
+    requested_egp_cents: int | None,
+    usdt_amount: Decimal | None,
+    network_code: str | None = None,
+) -> int | str:
+    """Create a withdrawal request with V2 (USDT-based) accounting.
+
+    Exactly one of requested_egp_cents or usdt_amount must be provided.
+    Returns the new request id on success, or an error string.
+
+    Errors:
+      "method_not_supported"
+      "destination_invalid"
+      "below_minimum"
+      "insufficient_balance"
+      "cooldown"
+      "rate_unavailable"
+    """
+    if method_code not in (WITHDRAWAL_METHOD_VODAFONE, WITHDRAWAL_METHOD_USDT):
+        return "method_not_supported"
+
+    # 1. Validate destination up front
+    if method_code == WITHDRAWAL_METHOD_VODAFONE:
+        if not validate_vodafone_destination(destination):
+            return "destination_invalid"
+        if requested_egp_cents is None or requested_egp_cents < VODAFONE_MIN_EGP_CENTS:
+            return "below_minimum"
+    else:  # usdt
+        if network_code != WITHDRAWAL_NETWORK_BEP20:
+            return "destination_invalid"
+        if not validate_usdt_bep20_address(destination):
+            return "destination_invalid"
+        if usdt_amount is None or usdt_amount < USDT_MIN_USDT:
+            return "below_minimum"
+
+    # 2. Fetch current rate (allow stale as fallback)
+    try:
+        rate, rate_provider, is_fresh = get_current_usdt_egp_rate(allow_stale=True)
+    except RuntimeError:
+        return "rate_unavailable"
+
+    if not is_fresh and not is_rate_within_max_age(_get_last_valid_rate()[2]):
+        return "rate_unavailable"
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+
+    # 3. Compute USDT accounting amount
+    if method_code == WITHDRAWAL_METHOD_VODAFONE:
+        usdt_amount = egp_to_usdt(requested_egp_cents, rate)
+        egp_equiv_cents = requested_egp_cents
+    else:
+        egp_equiv_cents = usdt_to_egp_cents(usdt_amount, rate)
+
+    usdt_micro = _usdt_to_micro(usdt_amount)
+    exchange_rate_micro = int(
+        (rate * Decimal("1000000")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    # Store EGP cents using legacy amount_cents (for backward compatibility)
+    amount_cents = egp_equiv_cents
+
+    # 4. Atomic transaction: cooldown + balance + insert
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # Block if user is fraud-blocked
+        user_row = conn.execute(
+            "SELECT balance_cents, withdrawal_blocked FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if user_row is None or user_row["withdrawal_blocked"]:
+            conn.rollback()
+            return "fraud"
+
+        # 24h cooldown check (any withdrawal method)
+        recent = conn.execute(
+            "SELECT 1 FROM withdrawal_requests "
+            "WHERE user_id = ? AND created_at >= "
+            "datetime('now', ?)",
+            (user_id, f"-{WITHDRAWAL_COOLDOWN_SECONDS} seconds"),
+        ).fetchone()
+        if recent is not None:
+            conn.rollback()
+            return "cooldown"
+
+        # Atomic balance deduction
+        cur = conn.execute(
+            "UPDATE users SET balance_cents = balance_cents - ? "
+            "WHERE user_id = ? AND balance_cents >= ?",
+            (amount_cents, user_id, amount_cents),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return "insufficient_balance"
+
+        cursor = conn.execute(
+            "INSERT INTO withdrawal_requests ("
+            "user_id, points_amount, amount_cents, withdrawal_method, "
+            "account_details, method_code, network_code, destination, "
+            "requested_egp_cents, usdt_micro, egp_equivalent_cents, "
+            "exchange_rate_micro, rate_fetched_at, rate_provider, "
+            "fee_cents, refunded, status"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            (
+                user_id,
+                amount_cents,
+                amount_cents,
+                method_code,  # legacy column
+                destination,
+                method_code,
+                network_code,
+                destination,
+                requested_egp_cents,
+                usdt_micro,
+                egp_equiv_cents,
+                exchange_rate_micro,
+                now_iso,
+                rate_provider,
+                0,
+                0,
+            ),
+        )
+        new_id = int(cursor.lastrowid)
+        conn.commit()
+    return new_id
+
+
+def get_v2_withdrawal_request(request_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM withdrawal_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+
+
+def list_pending_v2_withdrawals():
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM withdrawal_requests "
+            "WHERE status = 'pending' AND method_code IN (?, ?) "
+            "ORDER BY created_at ASC",
+            (WITHDRAWAL_METHOD_VODAFONE, WITHDRAWAL_METHOD_USDT),
+        ).fetchall()
+
+
+def complete_v2_withdrawal(request_id: int, admin_id: int,
+                           transaction_reference: str | None = None):
+    """Mark a V2 withdrawal as completed. Idempotent.
+
+    Does NOT deduct balance (already deducted at request time).
+    Refuses to complete a cancelled or already-completed request.
+    """
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM withdrawal_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None or row["status"] != "pending":
+            conn.rollback()
+            return None
+        if row["method_code"] not in (WITHDRAWAL_METHOD_VODAFONE, WITHDRAWAL_METHOD_USDT):
+            conn.rollback()
+            return None
+        conn.execute(
+            "UPDATE withdrawal_requests SET "
+            "status = 'completed', completed_at = CURRENT_TIMESTAMP, "
+            "admin_id = ?, transaction_reference = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (admin_id, transaction_reference, request_id),
+        )
+        conn.commit()
+        return conn.execute(
+            "SELECT * FROM withdrawal_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+
+
+def reject_v2_withdrawal(request_id: int, admin_id: int,
+                         reason: str | None = None):
+    """Reject a pending V2 withdrawal and refund exactly once."""
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM withdrawal_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None or row["status"] != "pending":
+            conn.rollback()
+            return None
+        if row["refunded"]:
+            conn.rollback()
+            return None
+        if row["method_code"] not in (WITHDRAWAL_METHOD_VODAFONE, WITHDRAWAL_METHOD_USDT):
+            conn.rollback()
+            return None
+        # Atomic refund
+        amount = int(row["amount_cents"] or row["points_amount"] or 0)
+        conn.execute(
+            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
+            (amount, row["user_id"]),
+        )
+        conn.execute(
+            "UPDATE withdrawal_requests SET "
+            "status = 'rejected', completed_at = CURRENT_TIMESTAMP, "
+            "admin_id = ?, refunded = 1 "
+            "WHERE id = ? AND status = 'pending'",
+            (admin_id, request_id),
+        )
+        conn.commit()
+        return conn.execute(
+            "SELECT * FROM withdrawal_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+
+
+def format_v2_withdrawal_customer_summary(row) -> str:
+    """Format a customer-facing summary. Never includes internal IDs, admin
+    notes, or supplier cost."""
+    method = row["method_code"]
+    dest = row["destination"]
+    usdt_amount = _micro_to_usdt(int(row["usdt_micro"] or 0))
+    rate = Decimal(int(row["exchange_rate_micro"] or 0)) / Decimal("1000000")
+    egp_equiv = _egp_cents_to_egp(int(row["egp_equivalent_cents"] or 0))
+
+    if method == WITHDRAWAL_METHOD_VODAFONE:
+        return (
+            "طريقة السحب:\nVodafone Cash\n\n"
+            f"المبلغ:\n{egp_equiv:.2f} EGP\n\n"
+            f"رسوم السحب:\n0 EGP\n\n"
+            f"سعر الصرف المستخدم:\n{rate:.4f} EGP / USDT\n\n"
+            f"القيمة المحاسبية:\n{usdt_amount:.6f} USDT\n\n"
+            f"المحفظة:\n{dest}"
+        )
+    return (
+        "طريقة السحب:\nUSDT\n\n"
+        "الشبكة:\nBNB Smart Chain (BEP-20)\n\n"
+        f"المبلغ:\n{usdt_amount:.6f} USDT\n\n"
+        f"القيمة التقريبية:\n{egp_equiv:.2f} EGP\n\n"
+        "رسوم السحب:\n0\n\n"
+        f"العنوان:\n{dest}"
+    )
+
+
+def format_v2_withdrawal_admin_summary(row) -> str:
+    """Format an admin-facing summary including rate, network, destination."""
+    method = row["method_code"]
+    dest = row["destination"]
+    usdt_amount = _micro_to_usdt(int(row["usdt_micro"] or 0))
+    rate = Decimal(int(row["exchange_rate_micro"] or 0)) / Decimal("1000000")
+    egp_equiv = _egp_cents_to_egp(int(row["egp_equivalent_cents"] or 0))
+    requested_egp = (
+        _egp_cents_to_egp(int(row["requested_egp_cents"] or 0))
+        if row["requested_egp_cents"] is not None
+        else None
+    )
+
+    lines = [
+        f"طلب سحب V2 #{row['id']}",
+        f"المستخدم: {row['user_id']}",
+        f"الطريقة: {method}",
+        f"الحالة: {row['status']}",
+        f"تاريخ الإنشاء: {row['created_at']}",
+    ]
+    if method == WITHDRAWAL_METHOD_VODAFONE:
+        lines.append(f"المبلغ المطلوب: {requested_egp:.2f} EGP" if requested_egp is not None else "المبلغ المطلوب: ?")
+        lines.append(f"ما يعادل USDT: {usdt_amount:.6f} USDT")
+        lines.append(f"رقم Vodafone: {dest}")
+    else:
+        lines.append(f"الشبكة: {WITHDRAWAL_NETWORK_DISPLAY}")
+        lines.append(f"المبلغ: {usdt_amount:.6f} USDT")
+        lines.append(f"ما يعادل EGP: {egp_equiv:.2f} EGP")
+        lines.append(f"عنوان المحفظة: {dest}")
+    lines.append(f"سعر الصرف: {rate:.4f} EGP/USDT")
+    lines.append(f"وقت جلب السعر: {row['rate_fetched_at']}")
+    lines.append(f"مزود السعر: {row['rate_provider']}")
+    lines.append(f"الرسوم: {_egp_cents_to_egp(int(row['fee_cents'] or 0))} EGP")
+    lines.append(f"تم الاسترداد: {'نعم' if row['refunded'] else 'لا'}")
+    if row["transaction_reference"]:
+        lines.append(f"مرجع المعاملة: {row['transaction_reference']}")
+    if row["completed_at"]:
+        lines.append(f"تاريخ الإكمال: {row['completed_at']}")
+    return "\n".join(lines)
+
+
+def get_v2_withdrawal_by_admin_message(admin_message_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM withdrawal_requests "
+            "WHERE admin_message_id = ? AND method_code IN (?, ?) "
+            "ORDER BY id DESC LIMIT 1",
+            (admin_message_id, WITHDRAWAL_METHOD_VODAFONE, WITHDRAWAL_METHOD_USDT),
+        ).fetchone()
 
 
 def create_payment_receipt(user_id: int, file_id: str) -> int:
@@ -3561,15 +4129,16 @@ def payment_keyboard() -> InlineKeyboardMarkup:
 
 
 def withdrawal_method_keyboard() -> InlineKeyboardMarkup:
+    """Customer-facing withdrawal method picker (V2 only)."""
     markup = InlineKeyboardMarkup()
     markup.row(
         InlineKeyboardButton(
             "فودافون كاش 🔴",
-            callback_data="withdraw_method_vodafone",
+            callback_data="withdraw_v2_vodafone",
         ),
         InlineKeyboardButton(
-            "عملات رقمية بايننس 🪙",
-            callback_data="withdraw_method_binance",
+            "USDT (BEP-20) 🪙",
+            callback_data="withdraw_v2_usdt",
         ),
     )
     markup.add(InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="back_main"))
@@ -3843,6 +4412,10 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     markup.add(InlineKeyboardButton(
         "💰 تعديل الحد الأدنى للسحب",
         callback_data="admin_set_min_withdrawal",
+    ))
+    markup.add(InlineKeyboardButton(
+        "💸 طلبات السحب V2 المعلقة",
+        callback_data="admin_list_v2_withdrawals",
     ))
     markup.add(InlineKeyboardButton("🔙 إغلاق اللوحة", callback_data="admin_close"))
     return markup
@@ -4915,6 +5488,462 @@ def handle_withdrawal_account(message):
     and user_state[m.from_user.id].get("step") == "awaiting_receipt",
     content_types=["photo"],
 )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── V2 Withdrawal Telegram Handlers ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "withdraw_v2_vodafone"
+)
+def callback_v2_withdraw_vodafone(call):
+    user_id = call.from_user.id
+    if not require_active_account(call):
+        return
+    cooldown = get_withdrawal_cooldown_remaining(user_id)
+    if cooldown > 0:
+        bot.answer_callback_query(
+            call.id,
+            f"⏳ لقد استخدمت طلب السحب الخاص بك بالفعل. "
+            f"يمكنك طلب سحب جديد بعد: {format_cooldown_remaining(cooldown)}.",
+            show_alert=True,
+        )
+        return
+    user_state[user_id] = {
+        "step": "awaiting_v2_vodafone_amount",
+        "method_code": WITHDRAWAL_METHOD_VODAFONE,
+    }
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        "💰 <b>سحب الأرباح — Vodafone Cash</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"الحد الأدنى: <b>10.00 EGP</b>\n\n"
+        "أرسل المبلغ بالجنيه المصري الذي تريد سحبه، مثل:\n"
+        "<code>10</code> أو <code>25.50</code>\n\n"
+        "<i>أرسل /start للإلغاء.</i>",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "withdraw_v2_usdt"
+)
+def callback_v2_withdraw_usdt(call):
+    user_id = call.from_user.id
+    if not require_active_account(call):
+        return
+    cooldown = get_withdrawal_cooldown_remaining(user_id)
+    if cooldown > 0:
+        bot.answer_callback_query(
+            call.id,
+            f"⏳ لقد استخدمت طلب السحب الخاص بك بالفعل. "
+            f"يمكنك طلب سحب جديد بعد: {format_cooldown_remaining(cooldown)}.",
+            show_alert=True,
+        )
+        return
+    user_state[user_id] = {
+        "step": "awaiting_v2_usdt_amount",
+        "method_code": WITHDRAWAL_METHOD_USDT,
+    }
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        "💰 <b>سحب الأرباح — USDT</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "الشبكة: <b>BNB Smart Chain (BEP-20)</b>\n\n"
+        f"الحد الأدنى: <b>0.15 USDT</b>\n\n"
+        "أرسل كمية USDT التي تريد سحبها، مثل:\n"
+        "<code>0.15</code> أو <code>1.5</code>\n\n"
+        "<i>أرسل /start للإلغاء.</i>",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in user_state
+    and user_state[m.from_user.id].get("step") == "awaiting_v2_vodafone_amount"
+)
+def handle_v2_vodafone_amount(message):
+    user_id = message.from_user.id
+    raw = (message.text or "").strip()
+    egp_cents = parse_currency_input(raw)
+    if egp_cents is None or egp_cents < VODAFONE_MIN_EGP_CENTS:
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ الحد الأدنى هو 10.00 EGP. أرسل المبلغ بالجنيه المصري.",
+        )
+        return
+    # Pre-fetch rate for display
+    try:
+        rate, provider, is_fresh = get_current_usdt_egp_rate(allow_stale=True)
+    except RuntimeError:
+        bot.send_message(
+            message.chat.id,
+            "⚠️ تعذر الحصول على سعر الصرف حالياً. حاول لاحقاً.",
+        )
+        return
+    if not is_fresh and not is_rate_within_max_age(_get_last_valid_rate()[2]):
+        bot.send_message(
+            message.chat.id,
+            "⚠️ سعر الصرف قديم جداً. حاول لاحقاً.",
+        )
+        return
+    usdt_amt = egp_to_usdt(egp_cents, rate)
+    user_state[user_id]["step"] = "awaiting_v2_vodafone_destination"
+    user_state[user_id]["requested_egp_cents"] = egp_cents
+    user_state[user_id]["usdt_amount_str"] = str(usdt_amt)
+    user_state[user_id]["rate"] = str(rate)
+    bot.send_message(
+        message.chat.id,
+        f"✅ المبلغ: <b>{_egp_cents_to_egp(egp_cents):.2f} EGP</b>\n"
+        f"💱 سعر الصرف: <b>{rate:.4f} EGP / USDT</b>\n"
+        f"💰 ما يعادل: <b>{usdt_amt:.6f} USDT</b>\n\n"
+        "📱 أرسل الآن رقم محفظة Vodafone Cash (11 رقم يبدأ بـ 01):",
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in user_state
+    and user_state[m.from_user.id].get("step") == "awaiting_v2_vodafone_destination"
+)
+def handle_v2_vodafone_destination(message):
+    user_id = message.from_user.id
+    dest = (message.text or "").strip()
+    if not validate_vodafone_destination(dest):
+        bot.send_message(
+            message.chat.id,
+            "⚠️ رقم Vodafone غير صالح. أرسل 11 رقم يبدأ بـ 01.",
+        )
+        return
+    state = user_state[user_id]
+    egp_cents = state["requested_egp_cents"]
+    rate = Decimal(state["rate"])
+    usdt_amt = egp_to_usdt(egp_cents, rate)
+    state["destination"] = dest
+    state["step"] = "awaiting_v2_vodafone_confirm"
+    bot.send_message(
+        message.chat.id,
+        "<b>تأكيد طلب السحب</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "طريقة السحب:\nVodafone Cash\n\n"
+        f"المبلغ:\n{_egp_cents_to_egp(egp_cents):.2f} EGP\n\n"
+        "رسوم السحب:\n0 EGP\n\n"
+        f"سعر الصرف المستخدم:\n{rate:.4f} EGP / USDT\n\n"
+        f"القيمة المحاسبية:\n{usdt_amt:.6f} USDT\n\n"
+        f"المحفظة:\n{dest}\n\n"
+        "هل تريد تأكيد الطلب؟",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأكيد", callback_data="v2_confirm_withdraw")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="back_main")],
+        ]),
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in user_state
+    and user_state[m.from_user.id].get("step") == "awaiting_v2_usdt_amount"
+)
+def handle_v2_usdt_amount(message):
+    user_id = message.from_user.id
+    raw = (message.text or "").strip()
+    try:
+        usdt_amt = Decimal(raw)
+    except (InvalidOperation, ValueError, TypeError):
+        bot.send_message(
+            message.chat.id,
+            "⚠️ أرسل كمية USDT صالحة (رقم موجب).",
+        )
+        return
+    if usdt_amt < USDT_MIN_USDT:
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ الحد الأدنى هو 0.15 USDT.",
+        )
+        return
+    try:
+        rate, provider, is_fresh = get_current_usdt_egp_rate(allow_stale=True)
+    except RuntimeError:
+        bot.send_message(
+            message.chat.id,
+            "⚠️ تعذر الحصول على سعر الصرف حالياً. حاول لاحقاً.",
+        )
+        return
+    if not is_fresh and not is_rate_within_max_age(_get_last_valid_rate()[2]):
+        bot.send_message(
+            message.chat.id,
+            "⚠️ سعر الصرف قديم جداً. حاول لاحقاً.",
+        )
+        return
+    user_state[user_id]["step"] = "awaiting_v2_usdt_destination"
+    user_state[user_id]["usdt_amount_str"] = str(usdt_amt)
+    user_state[user_id]["rate"] = str(rate)
+    egp_equiv = usdt_to_egp_cents(usdt_amt, rate)
+    bot.send_message(
+        message.chat.id,
+        f"✅ الكمية: <b>{usdt_amt:.6f} USDT</b>\n"
+        f"💱 سعر الصرف: <b>{rate:.4f} EGP / USDT</b>\n"
+        f"💰 ما يعادل: <b>{_egp_cents_to_egp(egp_equiv):.2f} EGP</b>\n\n"
+        "🌐 الشبكة: <b>BNB Smart Chain (BEP-20)</b>\n\n"
+        "📥 أرسل عنوان محفظتك على BEP-20 (يبدأ بـ 0x، 42 محرف):",
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in user_state
+    and user_state[m.from_user.id].get("step") == "awaiting_v2_usdt_destination"
+)
+def handle_v2_usdt_destination(message):
+    user_id = message.from_user.id
+    addr = (message.text or "").strip()
+    if not validate_usdt_bep20_address(addr):
+        bot.send_message(
+            message.chat.id,
+            "⚠️ عنوان BEP-20 غير صالح. يجب أن يبدأ بـ 0x ويكون 42 محرف hex.",
+        )
+        return
+    state = user_state[user_id]
+    usdt_amt = Decimal(state["usdt_amount_str"])
+    rate = Decimal(state["rate"])
+    egp_equiv = usdt_to_egp_cents(usdt_amt, rate)
+    state["destination"] = addr
+    state["step"] = "awaiting_v2_usdt_confirm"
+    bot.send_message(
+        message.chat.id,
+        "<b>تأكيد طلب السحب</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "طريقة السحب:\nUSDT\n\n"
+        "الشبكة:\nBNB Smart Chain (BEP-20)\n\n"
+        f"المبلغ:\n{usdt_amt:.6f} USDT\n\n"
+        f"القيمة التقريبية:\n{_egp_cents_to_egp(egp_equiv):.2f} EGP\n\n"
+        "رسوم السحب:\n0\n\n"
+        f"العنوان:\n{addr}\n\n"
+        "⚠️ تأكد أن العنوان يدعم شبكة BNB Smart Chain (BEP-20). "
+        "لا يمكن استرجاع المبلغ بعد التأكيد.\n\n"
+        "هل تريد تأكيد الطلب؟",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأكيد", callback_data="v2_confirm_withdraw")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="back_main")],
+        ]),
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "v2_confirm_withdraw"
+)
+def callback_v2_confirm_withdraw(call):
+    user_id = call.from_user.id
+    state = user_state.get(user_id)
+    if not state or state.get("step") not in (
+        "awaiting_v2_vodafone_confirm",
+        "awaiting_v2_usdt_confirm",
+    ):
+        bot.answer_callback_query(call.id, "⚠️ انتهت صلاحية الطلب.", show_alert=True)
+        return
+    method_code = state.get("method_code")
+    destination = state.get("destination")
+    if method_code == WITHDRAWAL_METHOD_VODAFONE:
+        requested_egp_cents = state.get("requested_egp_cents")
+        usdt_amount = None
+        network_code = None
+    else:
+        requested_egp_cents = None
+        usdt_amount = Decimal(state.get("usdt_amount_str"))
+        network_code = WITHDRAWAL_NETWORK_BEP20
+
+    user_state.pop(user_id, None)
+    bot.answer_callback_query(call.id, "⏳ جاري إنشاء الطلب...")
+
+    result = create_v2_withdrawal_request(
+        user_id=user_id,
+        method_code=method_code,
+        destination=destination,
+        requested_egp_cents=requested_egp_cents,
+        usdt_amount=usdt_amount,
+        network_code=network_code,
+    )
+
+    if isinstance(result, str):
+        bot.send_message(
+            call.message.chat.id,
+            _v2_error_message(result, user_id),
+        )
+        return
+
+    # Notify admin
+    row = get_v2_withdrawal_request(result)
+    try:
+        admin_text = "💰 <b>طلب سحب V2 جديد</b>\n" + format_v2_withdrawal_admin_summary(row)
+        admin_msg = bot.send_message(ADMIN_ID, admin_text)
+        conn_ref = get_connection()
+        conn_ref.execute(
+            "UPDATE withdrawal_requests SET admin_message_id = ? WHERE id = ?",
+            (admin_msg.message_id, result),
+        )
+        conn_ref.commit()
+    except Exception:
+        pass  # admin notif is best-effort
+
+    bot.send_message(
+        call.message.chat.id,
+        "✨ تم استلام طلب السحب الخاص بك بنجاح. "
+        "سيتم مراجعته وتحويل المبلغ خلال 24 ساعة كحد أقصى.",
+    )
+
+
+def _v2_error_message(code: str, user_id: int) -> str:
+    if code == "cooldown":
+        remaining = get_withdrawal_cooldown_remaining(user_id)
+        return (
+            "لقد استخدمت طلب السحب الخاص بك بالفعل.\n\n"
+            f"يمكنك طلب سحب جديد بعد: {format_cooldown_remaining(remaining)}."
+        )
+    if code == "below_minimum":
+        return "⚠️ المبلغ أقل من الحد الأدنى المسموح."
+    if code == "insufficient_balance":
+        return "❌ رصيدك غير كافٍ لإتمام هذا السحب."
+    if code == "destination_invalid":
+        return "⚠️ بيانات الوجهة غير صالحة."
+    if code == "method_not_supported":
+        return "⚠️ طريقة السحب غير مدعومة."
+    if code == "rate_unavailable":
+        return "⚠️ تعذر الحصول على سعر صرف محدّث. حاول لاحقاً."
+    if code == "fraud":
+        return "🚫 تم إيقاف طلب السحب مؤقتاً."
+    return "⚠️ تعذر إنشاء طلب السحب. حاول لاحقاً."
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin_list_v2_withdrawals"
+    and is_admin(c.from_user.id)
+)
+def callback_admin_list_v2_withdrawals(call):
+    rows = list_pending_v2_withdrawals()
+    if not rows:
+        bot.answer_callback_query(call.id, "لا توجد طلبات V2 معلقة.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    text = "💰 <b>طلبات السحب V2 المعلقة</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    markup = InlineKeyboardMarkup()
+    for row in rows[:10]:
+        usdt = _micro_to_usdt(int(row["usdt_micro"] or 0))
+        text += f"#{row['id']} — {row['method_code']} — {usdt:.4f} USDT\n"
+        markup.add(InlineKeyboardButton(
+            f"#{row['id']} — {row['method_code']}",
+            callback_data=f"admin_view_v2_withdrawal_{row['id']}",
+        ))
+    markup.add(InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+    bot.edit_message_text(
+        text, chat_id=call.message.chat.id,
+        message_id=call.message.message_id, reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin_view_v2_withdrawal_")
+    and is_admin(c.from_user.id)
+)
+def callback_admin_view_v2_withdrawal(call):
+    request_id = int(call.data[len("admin_view_v2_withdrawal_"):])
+    row = get_v2_withdrawal_request(request_id)
+    if row is None or row["method_code"] not in (
+        WITHDRAWAL_METHOD_VODAFONE, WITHDRAWAL_METHOD_USDT
+    ):
+        bot.answer_callback_query(call.id, "الطلب غير موجود.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    text = format_v2_withdrawal_admin_summary(row)
+    markup = InlineKeyboardMarkup()
+    if row["status"] == "pending":
+        markup.row(
+            InlineKeyboardButton("✅ إكمال", callback_data=f"admin_complete_v2_{request_id}"),
+            InlineKeyboardButton("❌ رفض", callback_data=f"admin_reject_v2_{request_id}"),
+        )
+    markup.add(InlineKeyboardButton("🔙 رجوع", callback_data="admin_list_v2_withdrawals"))
+    bot.edit_message_text(
+        text, chat_id=call.message.chat.id,
+        message_id=call.message.message_id, reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin_complete_v2_")
+    and is_admin(c.from_user.id)
+)
+def callback_admin_complete_v2(call):
+    request_id = int(call.data[len("admin_complete_v2_"):])
+    user_state[call.from_user.id] = {
+        "step": "awaiting_v2_tx_ref",
+        "request_id": request_id,
+    }
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        f"💰 إكمال طلب #{request_id}\n\n"
+        "أرسل مرجع المعاملة (transaction reference) أو أرسل '-' إذا لا يوجد:",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+    )
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id)
+    and user_state.get(m.from_user.id, {}).get("step") == "awaiting_v2_tx_ref"
+)
+def handle_admin_v2_tx_ref(message):
+    admin_id = message.from_user.id
+    state = user_state.get(admin_id, {})
+    request_id = state.get("request_id")
+    ref = (message.text or "").strip()
+    if ref == "-":
+        ref = None
+    user_state.pop(admin_id, None)
+    result = complete_v2_withdrawal(request_id, admin_id, ref)
+    if result is None:
+        bot.send_message(admin_id, "⚠️ تعذر إكمال الطلب.")
+        return
+    try:
+        bot.send_message(
+            result["user_id"],
+            "🎉 <b>تم تحويل أرباحك بنجاح!</b>\n\n"
+            f"تم اعتماد طلب السحب الخاص بك وإرسال المبلغ.",
+        )
+    except Exception:
+        pass
+    bot.send_message(
+        admin_id,
+        f"✅ تم إكمال طلب #{request_id} بنجاح.",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin_reject_v2_")
+    and is_admin(c.from_user.id)
+)
+def callback_admin_reject_v2(call):
+    request_id = int(call.data[len("admin_reject_v2_"):])
+    result = reject_v2_withdrawal(request_id, call.from_user.id)
+    if result is None:
+        bot.answer_callback_query(call.id, "⚠️ تعذر رفض الطلب.", show_alert=True)
+        return
+    try:
+        bot.send_message(
+            result["user_id"],
+            "ℹ️ <b>تم رفض طلب السحب</b>\n\n"
+            "تمت إعادة المبلغ إلى رصيدك.",
+        )
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id, f"تم رفض الطلب #{request_id} وإعادة المبلغ.")
+    bot.edit_message_text(
+        f"✅ تم رفض طلب #{request_id} وإعادة المبلغ للمستخدم.",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+    )
+
+
+
 def handle_payment_receipt(message):
     """يحفظ إيصال العميل ويرسله فوراً إلى المشرف."""
     user_id = message.from_user.id
@@ -6086,44 +7115,11 @@ def callback_withdraw_earnings(call):
     func=lambda call: call.data.startswith("withdraw_method_")
 )
 def callback_withdrawal_method(call):
-    user_id = call.from_user.id
-    user = get_user(user_id)
-    if user is None:
-        bot.answer_callback_query(
-            call.id,
-            "يرجى إرسال /start أولاً.",
-            show_alert=True,
-        )
-        return
-    if not require_active_account(call):
-        return
-
-    methods = {
-        "withdraw_method_vodafone": "فودافون كاش 🔴",
-        "withdraw_method_binance": "عملات رقمية بايننس 🪙",
-    }
-    method = methods.get(call.data)
-    if method is None:
-        bot.answer_callback_query(call.id, "طريقة سحب غير صالحة.", show_alert=True)
-        return
-
-    user_state[user_id] = {
-        "step": "awaiting_withdrawal_amount",
-        "withdrawal_method": method,
-    }
-    bot.answer_callback_query(call.id)
-    bot.edit_message_text(
-        f"✅ اخترت: <b>{method}</b>\n\n"
-        f"أرسل الآن المبلغ الذي تريد سحبه بالجنيه أو الدولار، مثل "
-        f"<code>12.35</code> أو <code>$0.50</code>.\n"
-        f"الحد الأدنى هو <b>{format_balance(get_min_withdrawal())}</b>، "
-        "ويجب ألا يتجاوز المبلغ رصيدك الحالي.\n\n"
-        "<i>أرسل /start للإلغاء.</i>",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ إلغاء", callback_data="back_main"),
-        ]]),
+    """Legacy entry point — refused. V2 is the only customer-facing flow."""
+    bot.answer_callback_query(
+        call.id,
+        "⚠️ تم تحديث نظام السحب. استخدم القائمة الجديدة للسحب.",
+        show_alert=True,
     )
 
 
