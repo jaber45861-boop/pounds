@@ -1023,5 +1023,416 @@ class TestWithdrawalEntryGate(unittest.TestCase):
             conn.execute("UPDATE users SET balance_cents = 10000 WHERE user_id = 8888")
             conn.commit()
 
+
+class _RecordingBot:
+    """Mock bot that records every answer_callback_query / edit_message_text call.
+
+    We assign this directly to gb.bot for the duration of the test so that
+    callback_withdraw_earnings() and callback_v2_withdraw_vodafone() operate
+    on it. The recorded calls let us assert on the actual Telegram flow
+    side-effects (dismissal, edited message text, inline keyboard).
+    """
+
+    def __init__(self):
+        self.answered = []
+        self.edits = []
+        self.sent = []
+
+    def answer_callback_query(self, call_id, text=None, show_alert=False, **_kw):
+        self.answered.append({
+            "call_id": call_id,
+            "text": text,
+            "show_alert": show_alert,
+        })
+
+    def edit_message_text(self, text, chat_id=None, message_id=None,
+                          reply_markup=None, **_kw):
+        self.edits.append({
+            "text": text,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": reply_markup,
+        })
+
+    def send_message(self, chat_id, text, reply_markup=None, **_kw):
+        self.sent.append({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": reply_markup,
+        })
+
+
+class _FakeUser:
+    def __init__(self, user_id):
+        self.id = user_id
+        self.first_name = "Regression"
+        self.is_bot = False
+
+
+class _FakeChat:
+    def __init__(self, chat_id):
+        self.id = chat_id
+
+
+class _FakeMessage:
+    def __init__(self, chat_id, message_id):
+        self.chat = _FakeChat(chat_id)
+        self.message_id = message_id
+
+
+class _FakeCall:
+    """Mimics a telebot telebot.types.CallbackQuery enough to drive the handlers."""
+    def __init__(self, user_id, data, chat_id=9001, message_id=42):
+        self.id = f"cb-{user_id}-{message_id}"
+        self.data = data
+        self.from_user = _FakeUser(user_id)
+        self.message = _FakeMessage(chat_id, message_id)
+
+
+class TestCallbackEntryGateRegression(unittest.TestCase):
+    """Real Telegram-flow regression for the customer entry point.
+
+    The original bug: callback_withdraw_earnings() had a generic
+        if row_balance_cents(user) < get_min_withdrawal():
+            ... reject with 'الحد الأدنى لسحب الأرباح هو 10.00 جنيه' ...
+    This blocked customers with balances between 5.00 EGP and 10.00 EGP
+    (above Vodafone dynamic $0.10 minimum at rate 50) from ever reaching
+    the method selector.
+
+    These tests invoke the actual callback_withdraw_earnings() handler
+    with a mocked bot, capture its real side-effects, and prove that:
+      - A 7.00 EGP user is NOT rejected with the legacy message.
+      - The method-selector screen is rendered with a V2 keyboard.
+      - The same holds for a 3.00 EGP user (the V2 Vodafone flow, not
+        the entry handler, is the authority for method-specific minimums).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._db_fd, cls.DB_PATH = tempfile.mkstemp(suffix=".db")
+        os.environ["BOT_DB_PATH"] = cls.DB_PATH
+        gb.init_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.unlink(cls.DB_PATH)
+
+    def setUp(self):
+        # Reset transient state for each test.
+        gb.user_state.clear()
+        with gb.get_connection() as conn:
+            conn.execute("DELETE FROM withdrawal_requests")
+            conn.execute("DELETE FROM users WHERE user_id IN (7001, 7002, 7003)")
+            conn.execute(
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "activation_status, is_verified, withdrawal_blocked) "
+                "VALUES (7001, 'SevenEGP', 700, 1, 1, 0)"
+            )
+            conn.execute(
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "activation_status, is_verified, withdrawal_blocked) "
+                "VALUES (7002, 'ThreeEGP', 300, 1, 1, 0)"
+            )
+            conn.execute(
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "activation_status, is_verified, withdrawal_blocked) "
+                "VALUES (7003, 'BigBalance', 5000, 1, 1, 0)"
+            )
+            conn.commit()
+        # Patch bot interface and bypass external-only checks.
+        self._real_bot = gb.bot
+        self.recorder = _RecordingBot()
+        gb.bot = self.recorder
+        self._real_require = gb.require_active_account
+        gb.require_active_account = lambda call: True
+        self._real_referral = gb.run_referral_withdrawal_double_check
+        gb.run_referral_withdrawal_double_check = (
+            lambda uid: {"blocked": False, "unknown": False}
+        )
+
+    def tearDown(self):
+        gb.bot = self._real_bot
+        gb.require_active_account = self._real_require
+        gb.run_referral_withdrawal_double_check = self._real_referral
+        gb.user_state.clear()
+
+    def _collect_callback_data(self, markup):
+        if markup is None:
+            return []
+        return [btn.callback_data for row in markup.keyboard for btn in row]
+
+    # ------------------------------------------------------------------ tests
+
+    def test_84_seven_egp_user_reaches_method_selector(self):
+        """7.00 EGP user (below legacy 10 EGP gate, above Vodafone 5.00 EGP
+        at rate 50) must reach the V2 method selector through
+        callback_withdraw_earnings() — not be rejected by a generic gate.
+        """
+        call = _FakeCall(user_id=7001, data="withdraw_earnings")
+        gb.callback_withdraw_earnings(call)
+
+        # The handler MUST answer the callback (dismiss spinner) ...
+        self.assertTrue(
+            self.recorder.answered,
+            "callback_withdraw_earnings did not call bot.answer_callback_query",
+        )
+        # ... and MUST edit the message to the method selector screen.
+        self.assertTrue(
+            self.recorder.edits,
+            "callback_withdraw_earnings did not call bot.edit_message_text",
+        )
+
+        edit = self.recorder.edits[-1]
+        rendered = edit["text"]
+        rendered_buttons = self._collect_callback_data(edit["reply_markup"])
+
+        # 1. The legacy "collect more" rejection MUST NOT appear.
+        self.assertNotIn("اجمع المزيد", rendered)
+        # 2. The legacy "الحد الأدنى لسحب الأرباح هو" line MUST NOT appear.
+        self.assertNotIn("الحد الأدنى لسحب الأرباح هو", rendered)
+        # 3. The method-selector screen MUST be shown.
+        self.assertIn("سحب الأرباح", rendered)
+        self.assertIn("اختر طريقة السحب", rendered)
+        # 4. The user's actual balance must be displayed in the header.
+        self.assertIn("7.00", rendered)
+        # 5. The keyboard MUST be the V2 method selector.
+        self.assertIn("withdraw_v2_vodafone", rendered_buttons,
+                      "Vodafone button missing from method selector keyboard")
+        self.assertIn("withdraw_v2_usdt", rendered_buttons,
+                      "USDT button missing from method selector keyboard")
+        # 6. The legacy get_min_withdrawal() value MUST NOT be displayed
+        #    (it is method-specific now).
+        # 7.00 EGP balance + Vodafone min 5.00 EGP proves the user can
+        # proceed; the rendered text would be misleading otherwise.
+        self.assertNotIn("10.00", rendered,
+                         "Legacy 10.00 EGP minimum still shown to customer")
+
+    def test_85_three_egp_user_also_reaches_method_selector(self):
+        """A 3.00 EGP user (below even Vodafone 5.00 EGP) must STILL
+        reach the method selector. Per-method minimums are enforced by
+        the V2 flow, not the entry handler. This proves the entry
+        handler is not doing hidden pre-screening.
+        """
+        call = _FakeCall(user_id=7002, data="withdraw_earnings")
+        gb.callback_withdraw_earnings(call)
+
+        self.assertTrue(self.recorder.edits)
+        edit = self.recorder.edits[-1]
+        rendered_buttons = self._collect_callback_data(edit["reply_markup"])
+
+        self.assertNotIn("اجمع المزيد", edit["text"])
+        self.assertIn("3.00", edit["text"])
+        self.assertIn("withdraw_v2_vodafone", rendered_buttons)
+        self.assertIn("withdraw_v2_usdt", rendered_buttons)
+
+    def test_86_high_balance_user_path_unchanged(self):
+        """A user with 50.00 EGP follows the same happy path. Guards
+        against an over-correction that might lock out legitimate users.
+        """
+        call = _FakeCall(user_id=7003, data="withdraw_earnings")
+        gb.callback_withdraw_earnings(call)
+
+        self.assertTrue(self.recorder.edits)
+        edit = self.recorder.edits[-1]
+        rendered_buttons = self._collect_callback_data(edit["reply_markup"])
+        self.assertIn("50.00", edit["text"])
+        self.assertIn("withdraw_v2_vodafone", rendered_buttons)
+        self.assertIn("withdraw_v2_usdt", rendered_buttons)
+
+    def test_87_entry_handler_emits_no_show_alert(self):
+        """A successful entry path must dismiss the spinner silently
+        (no show_alert). Alerts are reserved for genuine rejections
+        (referral, cooldown, missing user). This guards against a
+        regression where the generic 10 EGP gate (which used a full
+        edit_message_text replacement) is re-introduced as an alert
+        with a similar Arabic rejection string.
+        """
+        call = _FakeCall(user_id=7001, data="withdraw_earnings")
+        gb.callback_withdraw_earnings(call)
+        # The single answer must be a silent dismiss.
+        self.assertEqual(len(self.recorder.answered), 1)
+        self.assertFalse(
+            self.recorder.answered[0]["show_alert"],
+            "Entry handler emitted an alert (would indicate a generic gate)",
+        )
+
+    def test_88_legacy_gate_strings_absent_from_handler_output(self):
+        """Defensive: no edit produced by the entry handler may contain
+        any of the legacy gate strings — not just the main one. This
+        catches a partial regression where someone re-introduces a
+        similar but not identical Arabic phrase.
+        """
+        forbidden = [
+            "اجمع المزيد",
+            "الحد الأدنى لسحب الأرباح هو",
+            "10.00 جنيه",
+        ]
+        call = _FakeCall(user_id=7001, data="withdraw_earnings")
+        gb.callback_withdraw_earnings(call)
+        for edit in self.recorder.edits:
+            for token in forbidden:
+                self.assertNotIn(token, edit["text"],
+                                 f"Legacy gate text {token!r} reappeared "
+                                 f"in entry handler output")
+
+
+class TestV2VodafoneBoundaryAtRate50(unittest.TestCase):
+    """V2 Vodafone path boundary regression at rate 50 USD/EGP.
+
+    At rate 50: $0.10 minimum == 5.00 EGP exactly. The V2 flow must:
+      - Accept 5.00 EGP (boundary inclusive).
+      - Reject 4.99 EGP (just below).
+    These tests drive the real callback_v2_withdraw_vodafone() handler
+    plus a mocked customer message submission to assert the boundary
+    behavior end-to-end, not just on compute_vodafone_min_egp_cents().
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._db_fd, cls.DB_PATH = tempfile.mkstemp(suffix=".db")
+        os.environ["BOT_DB_PATH"] = cls.DB_PATH
+        gb.init_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.unlink(cls.DB_PATH)
+
+    def setUp(self):
+        gb.user_state.clear()
+        with gb.get_connection() as conn:
+            conn.execute("DELETE FROM withdrawal_requests")
+            conn.execute("DELETE FROM currency_settings")
+            conn.execute("DELETE FROM users WHERE user_id IN (8001, 8002)")
+            conn.execute(
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "activation_status, is_verified, withdrawal_blocked) "
+                "VALUES (8001, 'Boundary', 500, 1, 1, 0)"
+            )
+            conn.execute(
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "activation_status, is_verified, withdrawal_blocked) "
+                "VALUES (8002, 'Boundary', 499, 1, 1, 0)"
+            )
+            # Seed an exchange rate of 50 USDT/EGP, fresh.
+            conn.execute(
+                "INSERT INTO currency_settings (setting_key, setting_value, "
+                "updated_at) VALUES ('usdt_egp_rate', '50', CURRENT_TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO currency_settings (setting_key, setting_value, "
+                "updated_at) VALUES ('usdt_egp_rate_provider', 'test', "
+                "CURRENT_TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO currency_settings (setting_key, setting_value, "
+                "updated_at) VALUES ('usdt_egp_rate_fetched_at', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+            conn.commit()
+        self._real_bot = gb.bot
+        self.recorder = _RecordingBot()
+        gb.bot = self.recorder
+        self._real_require = gb.require_active_account
+        gb.require_active_account = lambda call: True
+
+    def tearDown(self):
+        gb.bot = self._real_bot
+        gb.require_active_account = self._real_require
+        gb.user_state.clear()
+
+    def _classroom_message(self, user_id, text):
+        """Build a minimal stand-in for telebot telebot.types.Message."""
+        msg = _FakeMessage(chat_id=user_id, message_id=1)
+        msg.text = text
+        msg.from_user = _FakeUser(user_id)
+        return msg
+
+    def test_89_five_egp_at_rate_50_accepted_by_minimum(self):
+        """At rate 50, 5.00 EGP == $0.10 (exact boundary). The V2
+        Vodafone amount handler must accept this and advance the user
+        to the destination-input step. The user_state['step'] must
+        become 'awaiting_v2_vodafone_destination'.
+        """
+        user_id = 8001
+        call = _FakeCall(user_id=user_id, data="withdraw_v2_vodafone")
+        gb.callback_v2_withdraw_vodafone(call)
+
+        # First, the V2 entry edit must show the dynamic minimum.
+        self.assertTrue(self.recorder.edits, "V2 Vodafone entry did not edit")
+        entry_text = self.recorder.edits[-1]["text"]
+        self.assertIn("Vodafone Cash", entry_text)
+        self.assertIn("0.10", entry_text)
+        self.assertIn("5.00 EGP", entry_text)
+
+        # User state should be waiting for amount.
+        self.assertEqual(
+            gb.user_state[user_id]["step"], "awaiting_v2_vodafone_amount"
+        )
+        self.recorder.edits.clear()
+        self.recorder.sent.clear()
+
+        # Now submit 5 EGP — boundary inclusive, must be accepted.
+        msg = self._classroom_message(user_id, "5")
+        gb.handle_v2_vodafone_amount(msg)
+
+        # No rejection message about minimum should have been sent.
+        rejection_texts = [
+            s["text"] for s in self.recorder.sent
+            if "الحد الأدنى" in s["text"]
+        ]
+        self.assertEqual(
+            rejection_texts, [],
+            f"5.00 EGP was wrongly rejected: {rejection_texts}",
+        )
+        # The user should be advanced to the destination step.
+        self.assertEqual(
+            gb.user_state[user_id]["step"],
+            "awaiting_v2_vodafone_destination",
+        )
+        # And there must be a "destination" prompt message.
+        destination_prompts = [
+            s for s in self.recorder.sent
+            if "Vodafone Cash" in s["text"] and "11 رقم" in s["text"]
+        ]
+        self.assertTrue(
+            destination_prompts,
+            "Expected destination prompt after accepting boundary amount",
+        )
+
+    def test_90_four_egp_99_at_rate_50_rejected_by_minimum(self):
+        """At rate 50, 4.99 EGP is just below the 5.00 EGP minimum.
+        The V2 flow must reject and NOT advance the user.
+        """
+        user_id = 8002
+        call = _FakeCall(user_id=user_id, data="withdraw_v2_vodafone")
+        gb.callback_v2_withdraw_vodafone(call)
+        self.recorder.edits.clear()
+        self.recorder.sent.clear()
+
+        msg = self._classroom_message(user_id, "4.99")
+        gb.handle_v2_vodafone_amount(msg)
+
+        # A minimum-rejection message must have been sent ...
+        rejection = [
+            s for s in self.recorder.sent if "الحد الأدنى" in s["text"]
+        ]
+        self.assertTrue(
+            rejection,
+            "Expected minimum-rejection message for 4.99 EGP at rate 50",
+        )
+        # ... and the state must NOT have advanced.
+        self.assertEqual(
+            gb.user_state[user_id]["step"], "awaiting_v2_vodafone_amount",
+            "User state advanced despite below-minimum amount",
+        )
+        # The rejection must reference the dynamic USD value, not a
+        # legacy 10.00 EGP string.
+        joined = " ".join(s["text"] for s in rejection)
+        self.assertIn("0.10", joined,
+                      "Rejection message does not mention $0.10 dynamic minimum")
+        self.assertNotIn("10.00", joined,
+                         "Rejection message references legacy 10.00 EGP minimum")
+
+
 if __name__ == "__main__":
     unittest.main()
