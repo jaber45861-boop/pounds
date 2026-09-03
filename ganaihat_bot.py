@@ -3333,7 +3333,7 @@ WITHDRAWAL_NETWORK_DISPLAY = "BNB Smart Chain (BEP-20)"
 USDT_MICRO_PER_USDT = Decimal("1000000")
 EGP_CENTS_PER_EGP = Decimal("100")
 
-VODAFONE_MIN_EGP_CENTS = 1000  # 10.00 EGP
+VODAFONE_MIN_USD = Decimal("0.10")
 USDT_MIN_USDT = Decimal("0.15")
 
 WITHDRAWAL_COOLDOWN_SECONDS = 24 * 60 * 60  # 24 hours
@@ -3465,6 +3465,51 @@ def is_rate_within_max_age(fetched_at_iso: str) -> bool:
     return 0 <= age <= MAX_RATE_AGE_SECONDS
 
 
+def _safe_fetch_current_rate(allow_stale: bool = True):
+    """Fetch the current USD/EGP rate using the existing V2 provider
+    infrastructure. USDT is pegged 1:1 to USD so the same rate applies.
+
+    Returns (rate: Decimal, is_fresh: bool). Raises RuntimeError if no rate
+    can be determined and no usable cached snapshot exists.
+    """
+    try:
+        rate, _provider, is_fresh = get_current_usdt_egp_rate(
+            allow_stale=allow_stale
+        )
+    except RuntimeError:
+        raise
+    return rate, is_fresh
+
+
+def compute_vodafone_min_egp_cents(rate: Decimal) -> int:
+    """Compute the dynamic Vodafone Cash minimum in EGP cents.
+
+    Formula: 0.10 USD × rate × 100 cents/EGP, rounded HALF_UP to integer cents.
+    """
+    if rate <= 0:
+        raise ValueError("rate_must_be_positive")
+    egp = (VODAFONE_MIN_USD * rate).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    return int(egp * EGP_CENTS_PER_EGP)
+
+
+def get_vodafone_min_egp_cents(allow_stale: bool = True) -> tuple[int, Decimal, bool]:
+    """Get the current Vodafone Cash minimum in EGP cents, the rate used,
+    and whether the rate was freshly fetched.
+
+    Uses the same safe rate policy as the rest of V2: tries a fresh
+    fetch first, then falls back to the cached snapshot if `allow_stale`
+    is True. Raises RuntimeError if no rate is available.
+    """
+    rate, is_fresh = _safe_fetch_current_rate(allow_stale=allow_stale)
+    if not is_fresh:
+        last = _get_last_valid_rate()
+        if last is None or not is_rate_within_max_age(last[2]):
+            raise RuntimeError("no_valid_rate_available")
+    return compute_vodafone_min_egp_cents(rate), rate, is_fresh
+
+
 def validate_vodafone_destination(destination: str) -> bool:
     """Validate a Vodafone Cash mobile number.
 
@@ -3579,15 +3624,11 @@ def create_v2_withdrawal_request(
     if method_code == WITHDRAWAL_METHOD_VODAFONE:
         if not validate_vodafone_destination(destination):
             return "destination_invalid"
-        if requested_egp_cents is None or requested_egp_cents < VODAFONE_MIN_EGP_CENTS:
-            return "below_minimum"
     else:  # usdt
         if network_code != WITHDRAWAL_NETWORK_BEP20:
             return "destination_invalid"
         if not validate_usdt_bep20_address(destination):
             return "destination_invalid"
-        if usdt_amount is None or usdt_amount < USDT_MIN_USDT:
-            return "below_minimum"
 
     # 2. Fetch current rate (allow stale as fallback)
     try:
@@ -3597,6 +3638,15 @@ def create_v2_withdrawal_request(
 
     if not is_fresh and not is_rate_within_max_age(_get_last_valid_rate()[2]):
         return "rate_unavailable"
+
+    # 2b. Compute dynamic Vodafone minimum and validate against it.
+    if method_code == WITHDRAWAL_METHOD_VODAFONE:
+        vodafone_min_egp_cents = compute_vodafone_min_egp_cents(rate)
+        if requested_egp_cents is None or requested_egp_cents < vodafone_min_egp_cents:
+            return "below_minimum"
+    else:  # usdt
+        if usdt_amount is None or usdt_amount < USDT_MIN_USDT:
+            return "below_minimum"
 
     now_iso = datetime.utcnow().isoformat() + "Z"
 
@@ -5515,12 +5565,25 @@ def callback_v2_withdraw_vodafone(call):
         "method_code": WITHDRAWAL_METHOD_VODAFONE,
     }
     bot.answer_callback_query(call.id)
+    try:
+        min_egp_cents, _rate, _is_fresh = get_vodafone_min_egp_cents(
+            allow_stale=True
+        )
+        egp_equiv = _egp_cents_to_egp(min_egp_cents)
+    except RuntimeError:
+        bot.edit_message_text(
+            "⚠️ تعذر الحصول على سعر الصرف الحالي. حاول لاحقاً.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        return
     bot.edit_message_text(
         "💰 <b>سحب الأرباح — Vodafone Cash</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"الحد الأدنى: <b>10.00 EGP</b>\n\n"
+        f"الحد الأدنى: <b>${VODAFONE_MIN_USD:.2f}</b> "
+        f"(≈ <b>{egp_equiv:.2f} EGP</b>)\n\n"
         "أرسل المبلغ بالجنيه المصري الذي تريد سحبه، مثل:\n"
-        "<code>10</code> أو <code>25.50</code>\n\n"
+        "<code>5</code> أو <code>25.50</code>\n\n"
         "<i>أرسل /start للإلغاء.</i>",
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
@@ -5569,13 +5632,7 @@ def handle_v2_vodafone_amount(message):
     user_id = message.from_user.id
     raw = (message.text or "").strip()
     egp_cents = parse_currency_input(raw)
-    if egp_cents is None or egp_cents < VODAFONE_MIN_EGP_CENTS:
-        bot.send_message(
-            message.chat.id,
-            f"⚠️ الحد الأدنى هو 10.00 EGP. أرسل المبلغ بالجنيه المصري.",
-        )
-        return
-    # Pre-fetch rate for display
+    # Pre-fetch rate for display and dynamic minimum
     try:
         rate, provider, is_fresh = get_current_usdt_egp_rate(allow_stale=True)
     except RuntimeError:
@@ -5588,6 +5645,15 @@ def handle_v2_vodafone_amount(message):
         bot.send_message(
             message.chat.id,
             "⚠️ سعر الصرف قديم جداً. حاول لاحقاً.",
+        )
+        return
+    min_egp_cents = compute_vodafone_min_egp_cents(rate)
+    if egp_cents is None or egp_cents < min_egp_cents:
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ الحد الأدنى هو <b>${VODAFONE_MIN_USD:.2f}</b> "
+            f"(≈ <b>{_egp_cents_to_egp(min_egp_cents):.2f} EGP</b>). "
+            "أرسل المبلغ بالجنيه المصري.",
         )
         return
     usdt_amt = egp_to_usdt(egp_cents, rate)
