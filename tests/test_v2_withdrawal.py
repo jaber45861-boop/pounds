@@ -10,14 +10,16 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "1:TEST")
 os.environ.setdefault("API_SECRET", "")
 os.environ.setdefault("SESSION_SECRET", "")
 
-sys.path.insert(0, "/root/pounds")
-
 import decimal as _decimal
 import importlib.util
 
+# Portable project-relative path: tests/ lives next to ganaihat_bot.py
+_BOT_FILE = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ganaihat_bot.py")
+)
 _spec = importlib.util.spec_from_file_location(
     "ganaihat_bot",
-    "/root/pounds/ganaihat_bot.py",
+    _BOT_FILE,
     submodule_search_locations=[],
 )
 _mod = importlib.util.module_from_spec(_spec)
@@ -29,14 +31,14 @@ gb = _mod
 
 
 class TestV2Constants(unittest.TestCase):
-    def test_01_vodafone_minimum(self):
-        self.assertEqual(gb.VODAFONE_MIN_EGP_CENTS, 1000)
+    def test_01_vodafone_minimum_usd(self):
+        # Fixed USD minimum for Vodafone Cash
+        self.assertEqual(gb.VODAFONE_MIN_USD, Decimal("0.10"))
 
     def test_02_usdt_minimum(self):
         self.assertEqual(gb.USDT_MIN_USDT, Decimal("0.15"))
 
     def test_03_withdrawal_fee_is_zero(self):
-        self.assertEqual(gb.VODAFONE_MIN_EGP_CENTS, 1000)  # sanity
         self.assertEqual(gb.WITHDRAWAL_COOLDOWN_SECONDS, 86400)
 
     def test_04_cooldown_is_24_hours(self):
@@ -231,12 +233,13 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         )
         self.assertIsInstance(result, int)
 
-    def test_37_vodafone_9_99_rejected(self):
+    def test_37_vodafone_below_dynamic_minimum_rejected(self):
+        # At rate 50, 0.10 USD = 5.00 EGP. 4.99 EGP is below minimum.
         result = gb.create_v2_withdrawal_request(
             user_id=999,
             method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
             destination="01012345678",
-            requested_egp_cents=999,
+            requested_egp_cents=499,
             usdt_amount=None,
         )
         self.assertEqual(result, "below_minimum")
@@ -421,7 +424,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
             user_id=999,
             method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
             destination="01012345678",
-            requested_egp_cents=500,  # below minimum
+            requested_egp_cents=499,  # below dynamic minimum (5.00 EGP at rate 50)
             usdt_amount=None,
         )
         after = gb.get_user(999)["balance_cents"]
@@ -668,6 +671,176 @@ class TestV2CustomerRouting(unittest.TestCase):
             "SELECT COUNT(*) FROM withdrawal_requests WHERE user_id = 999"
         ).fetchone()[0]
         self.assertEqual(before, after)
+
+
+class TestVodafoneDynamicMinimum(unittest.TestCase):
+    """Verify the Vodafone Cash minimum is $0.10 USD fixed and the EGP
+    equivalent is computed dynamically from the current USD/EGP rate."""
+
+    def test_fixed_usd_minimum_is_010(self):
+        self.assertEqual(gb.VODAFONE_MIN_USD, Decimal("0.10"))
+
+    def test_dynamic_minimum_at_rate_50(self):
+        # 0.10 × 50 = 5.00 EGP = 500 cents
+        self.assertEqual(gb.compute_vodafone_min_egp_cents(Decimal("50")), 500)
+
+    def test_dynamic_minimum_at_rate_51(self):
+        # 0.10 × 51 = 5.10 EGP = 510 cents
+        self.assertEqual(gb.compute_vodafone_min_egp_cents(Decimal("51")), 510)
+
+    def test_dynamic_minimum_at_rate_52(self):
+        # 0.10 × 52 = 5.20 EGP = 520 cents
+        self.assertEqual(gb.compute_vodafone_min_egp_cents(Decimal("52")), 520)
+
+    def test_dynamic_minimum_at_rate_55(self):
+        # 0.10 × 55 = 5.50 EGP = 550 cents
+        self.assertEqual(gb.compute_vodafone_min_egp_cents(Decimal("55")), 550)
+
+    def test_dynamic_minimum_at_rate_53(self):
+        # 0.10 × 53 = 5.30 EGP = 530 cents
+        self.assertEqual(gb.compute_vodafone_min_egp_cents(Decimal("53")), 530)
+
+    def test_no_hardcoded_50_egp_per_usd_default(self):
+        # The function must compute from the passed rate, not a baked-in 50.
+        self.assertNotEqual(
+            gb.compute_vodafone_min_egp_cents(Decimal("60")),
+            gb.compute_vodafone_min_egp_cents(Decimal("50")),
+        )
+
+    def test_minimum_changes_when_rate_changes(self):
+        # The customer-facing EGP minimum must change with the rate
+        self.assertNotEqual(
+            gb.compute_vodafone_min_egp_cents(Decimal("50")),
+            gb.compute_vodafone_min_egp_cents(Decimal("55")),
+        )
+
+    def test_no_legacy_constant_remains(self):
+        # The old hardcoded 10.00 EGP / 1000-cents constant must not be used.
+        self.assertFalse(hasattr(gb, "VODAFONE_MIN_EGP_CENTS"))
+
+    def test_usdt_minimum_unchanged(self):
+        # USDT rules must not have changed
+        self.assertEqual(gb.USDT_MIN_USDT, Decimal("0.15"))
+        self.assertEqual(gb.WITHDRAWAL_NETWORK_BEP20, "BSC_BEP20")
+        self.assertIn("BEP-20", gb.WITHDRAWAL_NETWORK_DISPLAY)
+
+
+class TestVodafoneEnforcementAtRate(unittest.TestCase):
+    """Verify the actual V2 withdrawal creation uses the dynamic minimum,
+    not a hardcoded value, and that boundary values behave correctly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._db_fd, cls.DB_PATH = tempfile.mkstemp(suffix=".db")
+        os.environ["BOT_DB_PATH"] = cls.DB_PATH
+        gb.init_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.unlink(cls.DB_PATH)
+
+    def setUp(self):
+        with gb.get_connection() as conn:
+            conn.execute("DELETE FROM withdrawal_requests")
+            conn.execute("DELETE FROM users WHERE user_id = 555")
+            conn.execute(
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "activation_status, is_verified, withdrawal_blocked) "
+                "VALUES (555, 'T', 1000000, 1, 1, 0)"
+            )
+            conn.commit()
+
+    def _seed_rate(self, rate):
+        gb._save_rate_snapshot(Decimal(str(rate)), "test_dynamic")
+
+    def test_exact_minimum_accepted_at_rate_50(self):
+        self._seed_rate(50)
+        # 5.00 EGP = 500 cents, exactly equal to dynamic minimum
+        result = gb.create_v2_withdrawal_request(
+            user_id=555,
+            method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
+            destination="01012345678",
+            requested_egp_cents=500,
+            usdt_amount=None,
+        )
+        self.assertIsInstance(result, int)
+
+    def test_one_cent_below_minimum_rejected_at_rate_50(self):
+        self._seed_rate(50)
+        # 4.99 EGP = 499 cents, one cent below
+        result = gb.create_v2_withdrawal_request(
+            user_id=555,
+            method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
+            destination="01012345678",
+            requested_egp_cents=499,
+            usdt_amount=None,
+        )
+        self.assertEqual(result, "below_minimum")
+
+    def test_minimum_at_rate_52(self):
+        self._seed_rate(52)
+        # 5.20 EGP = 520 cents accepted
+        ok = gb.create_v2_withdrawal_request(
+            user_id=555,
+            method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
+            destination="01012345678",
+            requested_egp_cents=520,
+            usdt_amount=None,
+        )
+        self.assertIsInstance(ok, int)
+        # 5.19 EGP rejected
+        with gb.get_connection() as conn:
+            conn.execute("DELETE FROM withdrawal_requests")
+            conn.commit()
+        bad = gb.create_v2_withdrawal_request(
+            user_id=555,
+            method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
+            destination="01012345678",
+            requested_egp_cents=519,
+            usdt_amount=None,
+        )
+        self.assertEqual(bad, "below_minimum")
+
+    def test_rate_snapshot_preserved_on_request(self):
+        self._seed_rate(52)
+        rid = gb.create_v2_withdrawal_request(
+            user_id=555,
+            method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
+            destination="01012345678",
+            requested_egp_cents=520,
+            usdt_amount=None,
+        )
+        row1 = gb.get_v2_withdrawal_request(rid)
+        # Change rate after request creation
+        self._seed_rate(99)
+        row2 = gb.get_v2_withdrawal_request(rid)
+        self.assertEqual(row1["exchange_rate_micro"], row2["exchange_rate_micro"])
+        self.assertEqual(row1["egp_equivalent_cents"], row2["egp_equivalent_cents"])
+
+    def test_usdt_minimum_unchanged_at_rate(self):
+        self._seed_rate(50)
+        # 0.15 USDT still the minimum
+        result_ok = gb.create_v2_withdrawal_request(
+            user_id=555,
+            method_code=gb.WITHDRAWAL_METHOD_USDT,
+            destination="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+            requested_egp_cents=None,
+            usdt_amount=Decimal("0.15"),
+            network_code=gb.WITHDRAWAL_NETWORK_BEP20,
+        )
+        self.assertIsInstance(result_ok, int)
+        with gb.get_connection() as conn:
+            conn.execute("DELETE FROM withdrawal_requests")
+            conn.commit()
+        result_bad = gb.create_v2_withdrawal_request(
+            user_id=555,
+            method_code=gb.WITHDRAWAL_METHOD_USDT,
+            destination="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+            requested_egp_cents=None,
+            usdt_amount=Decimal("0.149"),
+            network_code=gb.WITHDRAWAL_NETWORK_BEP20,
+        )
+        self.assertEqual(result_bad, "below_minimum")
 
 
 if __name__ == "__main__":
