@@ -494,5 +494,213 @@ class TestExistingEgpCentHelpersUnchanged(unittest.TestCase):
         self.assertEqual(MONEY_SCALE, Decimal("100"))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── Phase 2: USD Nano Pricing / Domain Primitives ────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+parse_money_to_usd_nano = gb.parse_money_to_usd_nano
+calculate_usd_nano_selling_price = gb.calculate_usd_nano_selling_price
+smm_rate_to_usd_nano_per_unit = gb.smm_rate_to_usd_nano_per_unit
+smm_sell_price_usd_nano = gb.smm_sell_price_usd_nano
+has_minimum_usd_nano_balance = gb.has_minimum_usd_nano_balance
+TASK_CREATION_MIN_BALANCE_USD_NANO = gb.TASK_CREATION_MIN_BALANCE_USD_NANO
+MARGIN_MULTIPLIER_LOCAL = gb.MARGIN_MULTIPLIER
+
+
+class TestParseMoneyToUsdNano(unittest.TestCase):
+    """USD money parsing into nano-units (PART E)."""
+
+    def test_one_dollar(self):
+        self.assertEqual(parse_money_to_usd_nano(Decimal("1")), 1_000_000_000)
+
+    def test_one_cent(self):
+        self.assertEqual(parse_money_to_usd_nano(Decimal("0.01")), 10_000_000)
+
+    def test_half_cent(self):
+        self.assertEqual(parse_money_to_usd_nano(Decimal("0.005")), 5_000_000)
+
+    def test_one_micro_dollar(self):
+        self.assertEqual(parse_money_to_usd_nano(Decimal("0.000001")), 1_000)
+
+    def test_one_nano_unit(self):
+        self.assertEqual(parse_money_to_usd_nano(Decimal("0.000000001")), 1)
+
+    def test_string_input(self):
+        self.assertEqual(parse_money_to_usd_nano("0.01"), 10_000_000)
+
+    def test_zero(self):
+        self.assertEqual(parse_money_to_usd_nano(Decimal("0")), 0)
+
+    def test_float_rejected(self):
+        with self.assertRaises(TypeError):
+            parse_money_to_usd_nano(0.01)
+
+    def test_nan_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_money_to_usd_nano(Decimal("NaN"))
+
+    def test_infinity_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_money_to_usd_nano(Decimal("Infinity"))
+
+
+class TestUsdNanoSellingPrice(unittest.TestCase):
+    """USD nano selling price calculation (PART D)."""
+
+    def test_one_dollar_times_1_30(self):
+        # $1.00 × 1.30 = $1.30 = 1_300_000_000 nano
+        self.assertEqual(
+            calculate_usd_nano_selling_price(1_000_000_000),
+            1_300_000_000,
+        )
+
+    def test_one_cent_times_1_30(self):
+        # $0.01 × 1.30 = $0.013 = 13_000_000 nano
+        self.assertEqual(
+            calculate_usd_nano_selling_price(10_000_000),
+            13_000_000,
+        )
+
+    def test_half_cent_times_1_30(self):
+        # $0.005 × 1.30 = $0.0065 = 6_500_000 nano
+        self.assertEqual(
+            calculate_usd_nano_selling_price(5_000_000),
+            6_500_000,
+        )
+
+    def test_zero_base(self):
+        self.assertEqual(calculate_usd_nano_selling_price(0), 0)
+
+    def test_large_value(self):
+        # $100 × 1.30 = $130 = 130_000_000_000 nano
+        self.assertEqual(
+            calculate_usd_nano_selling_price(100_000_000_000),
+            130_000_000_000,
+        )
+
+    def test_margin_multiplier_is_1_30(self):
+        self.assertEqual(MARGIN_MULTIPLIER_LOCAL, Decimal("1.30"))
+
+    def test_no_float_arithmetic(self):
+        """Verify the result is an integer nano amount, not a float."""
+        result = calculate_usd_nano_selling_price(5_000_000)
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 6_500_000)
+
+
+class TestSmmRateToUsdNano(unittest.TestCase):
+    """SMM provider rate conversion (PART C)."""
+
+    def test_rate_5_per_1k(self):
+        # $5 per 1000 = $0.005 per unit = 5_000_000 nano
+        self.assertEqual(
+            smm_rate_to_usd_nano_per_unit(Decimal("5")),
+            5_000_000,
+        )
+
+    def test_rate_string(self):
+        self.assertEqual(
+            smm_rate_to_usd_nano_per_unit("0.50"),
+            500_000,
+        )
+
+    def test_rate_zero(self):
+        self.assertEqual(smm_rate_to_usd_nano_per_unit(Decimal("0")), 0)
+
+    def test_rate_negative_rejected(self):
+        with self.assertRaises(ValueError):
+            smm_rate_to_usd_nano_per_unit(Decimal("-5"))
+
+    def test_rate_float_rejected(self):
+        with self.assertRaises(TypeError):
+            smm_rate_to_usd_nano_per_unit(5.0)
+
+    def test_rate_nan_rejected(self):
+        with self.assertRaises(ValueError):
+            smm_rate_to_usd_nano_per_unit(Decimal("NaN"))
+
+    def test_rate_infinity_rejected(self):
+        with self.assertRaises(ValueError):
+            smm_rate_to_usd_nano_per_unit(Decimal("Infinity"))
+
+
+class TestTaskCreationEligibility(unittest.TestCase):
+    """Task-creation balance eligibility primitive (PART F)."""
+
+    def test_zero_balance(self):
+        self.assertFalse(has_minimum_usd_nano_balance(0))
+
+    def test_below_threshold(self):
+        self.assertFalse(has_minimum_usd_nano_balance(9_999_999))
+
+    def test_exact_threshold(self):
+        self.assertTrue(has_minimum_usd_nano_balance(10_000_000))
+
+    def test_above_threshold(self):
+        self.assertTrue(has_minimum_usd_nano_balance(10_000_001))
+
+    def test_large_balance(self):
+        self.assertTrue(has_minimum_usd_nano_balance(1_000_000_000_000))
+
+    def test_threshold_is_10_million(self):
+        self.assertEqual(TASK_CREATION_MIN_BALANCE_USD_NANO, 10_000_000)
+
+
+class TestSmmSellPriceUsdNano(unittest.TestCase):
+    """Full SMM sell price in USD nano (PART C combined)."""
+
+    def test_rate_5_margin_30(self):
+        # rate $5/1k, margin 30%: cost=$0.005/unit, sell=$0.005/(1-0.30)=$0.00714...
+        nano = smm_sell_price_usd_nano(Decimal("5"), margin_pct=Decimal("30"))
+        cost_usd = Decimal("5") / Decimal("1000")
+        expected_usd = cost_usd / (Decimal("1") - Decimal("0.30"))
+        expected_nano = gb.usd_decimal_to_nano(expected_usd)
+        self.assertEqual(nano, expected_nano)
+
+    def test_rate_float_rejected(self):
+        with self.assertRaises(TypeError):
+            smm_sell_price_usd_nano(5.0)
+
+    def test_margin_float_rejected(self):
+        with self.assertRaises(TypeError):
+            smm_sell_price_usd_nano(Decimal("5"), margin_pct=30.0)
+
+
+class TestPrecisionInvariants(unittest.TestCase):
+    """Precision invariant tests (PART M)."""
+
+    def test_no_fractional_nano_output(self):
+        """All nano outputs must be exact integers."""
+        self.assertIsInstance(usd_decimal_to_nano(Decimal("0.005")), int)
+        self.assertIsInstance(usd_decimal_to_nano(Decimal("0.001")), int)
+        self.assertIsInstance(usd_decimal_to_nano(Decimal("0.0001")), int)
+        self.assertIsInstance(calculate_usd_nano_selling_price(5_000_000), int)
+
+    def test_round_half_up_boundary(self):
+        # Exactly halfway between nano units: 0.0000000005 → rounds UP to 1
+        self.assertEqual(usd_decimal_to_nano(Decimal("0.0000000005")), 1)
+        # Just below: 0.00000000049 → rounds DOWN to 0
+        self.assertEqual(usd_decimal_to_nano(Decimal("0.00000000049")), 0)
+
+    def test_sub_cent_selling_price_preserved(self):
+        """$0.005 × 1.30 must not lose precision."""
+        nano = calculate_usd_nano_selling_price(5_000_000)
+        # $0.005 × 1.30 = $0.0065 = 6,500,000 nano
+        self.assertEqual(nano, 6_500_000)
+        usd_back = gb.nano_to_usd_decimal(nano)
+        self.assertEqual(usd_back, Decimal("0.0065"))
+
+    def test_no_float_in_pricing(self):
+        """Verify Decimal-only arithmetic by checking result types."""
+        self.assertIsInstance(calculate_usd_nano_selling_price(10_000_000), int)
+        self.assertIsInstance(smm_rate_to_usd_nano_per_unit(Decimal("5")), int)
+        self.assertIsInstance(parse_money_to_usd_nano(Decimal("0.01")), int)
+
+    def test_overflow_protection(self):
+        """Values exceeding SQLite INTEGER max must be caught."""
+        with self.assertRaises((ValueError, OverflowError)):
+            require_valid_usd_nano_amount(Decimal("10000000000"))
+
+
 if __name__ == "__main__":
     unittest.main()

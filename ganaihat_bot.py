@@ -354,6 +354,104 @@ def require_valid_usd_nano_amount(value) -> int:
     if n > 2**63 - 1:
         raise ValueError(f"Nano amount exceeds SQLite INTEGER max: {n}")
     return n
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── USD Nano Pricing / Domain Primitives (Phase 2) ───────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# These helpers prepare the application for the future USD-nano migration.
+# They do NOT replace existing EGP-cent accounting yet.
+
+def parse_money_to_usd_nano(value) -> int:
+    """Parse a USD decimal string/Decimal into integer USD nano-units.
+
+    Decimal/string input only — float rejected.
+    Uses ROUND_HALF_UP at the nano boundary.
+    """
+    if isinstance(value, float):
+        raise TypeError(
+            f"float input rejected for USD parsing: {value!r}. "
+            "Use Decimal or a decimal string instead."
+        )
+    d = Decimal(str(value).strip()) if not isinstance(value, Decimal) else value
+    if d.is_nan() or d.is_infinite():
+        raise ValueError(f"Non-finite USD value: {d}")
+    return usd_decimal_to_nano(d)
+
+
+def calculate_usd_nano_selling_price(base_cost_nano: int) -> int:
+    """Calculate the selling price in USD nano-units with the platform margin.
+
+    selling_price = base_cost × MARGIN_MULTIPLIER
+
+    Result is an integer USD nano-amount (sub-cent precision preserved).
+    Uses Decimal arithmetic only — no float.
+    """
+    base = nano_to_usd_decimal(base_cost_nano)
+    selling = (base * MARGIN_MULTIPLIER).quantize(
+        Decimal("0.000000001"), rounding=ROUND_HALF_UP
+    )
+    return usd_decimal_to_nano(selling)
+
+
+def smm_rate_to_usd_nano_per_unit(rate_per_1k_usd) -> int:
+    """Convert an SMM provider rate (USD per 1000 units) to USD nano per unit.
+
+    Accepts Decimal/string input only — float rejected at the boundary.
+    Returns integer USD nano-units per single unit.
+    """
+    if isinstance(rate_per_1k_usd, float):
+        raise TypeError(
+            f"float SMM rate rejected: {rate_per_1k_usd!r}. Use Decimal/string."
+        )
+    rate = Decimal(str(rate_per_1k_usd).strip()) if not isinstance(rate_per_1k_usd, Decimal) else rate_per_1k_usd
+    if rate.is_nan() or rate.is_infinite():
+        raise ValueError(f"Non-finite SMM rate: {rate}")
+    if rate < 0:
+        raise ValueError(f"Negative SMM rate not supported: {rate}")
+    # USD per unit = rate / 1000
+    usd_per_unit = rate / Decimal("1000")
+    return usd_decimal_to_nano(usd_per_unit)
+
+
+def smm_sell_price_usd_nano(rate_per_1k_usd, margin_pct=None) -> int:
+    """Calculate the SMM selling price in USD nano for a given provider rate.
+
+    The provider rate means USD per 1000 units.
+    The selling price applies the platform margin:
+        selling_price_egp = cost / (1 - margin)  (existing business rule)
+
+    This helper produces the equivalent in USD nano-units,
+    preserving the existing business meaning.
+    """
+    if isinstance(margin_pct, float):
+        raise TypeError(
+            f"float margin rejected: {margin_pct!r}. Use Decimal/int/string."
+        )
+    if margin_pct is None:
+        margin_pct = Decimal(str(SMM_MARGIN_PCT)) if isinstance(SMM_MARGIN_PCT, float) else Decimal("30")
+    margin_decimal = Decimal(str(margin_pct)) / Decimal("100")
+    cost_nano = smm_rate_to_usd_nano_per_unit(rate_per_1k_usd)
+    cost_usd = nano_to_usd_decimal(cost_nano)
+    if margin_decimal < 1:
+        sell_usd = cost_usd / (Decimal("1") - margin_decimal)
+    else:
+        sell_usd = cost_usd
+    return usd_decimal_to_nano(sell_usd)
+
+
+# Task-creation eligibility threshold: wallet >= $0.01
+TASK_CREATION_MIN_BALANCE_USD_NANO = 10_000_000
+
+
+def has_minimum_usd_nano_balance(balance_usd_nano: int) -> bool:
+    """Return True when balance meets the task-creation eligibility threshold.
+
+    This is a pure domain primitive — NOT wired into live task creation yet.
+    """
+    return balance_usd_nano >= TASK_CREATION_MIN_BALANCE_USD_NANO
+
+
 WITHDRAWAL_COOLDOWN_MESSAGE = (
     "⚠️ تنبيه: مسموح بطلب سحب واحد فقط كل 24 ساعة لمنع الضغط! "
     "يمكنك تقديم طلب جديد غداً."
@@ -839,7 +937,11 @@ def refresh_promotion_packages() -> dict[str, dict]:
             "label": row["label"],
             "target_subscribers": int(row["target_subscribers"]),
             "points_cost": int(row["points_cost"]),
-            "usd_price": float(row["points_cost"]) / 100 / float(EGP_PER_USD),
+            "usd_price": float(
+                (Decimal(str(row["points_cost"])) / Decimal("100") / EGP_PER_USD).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            ),
         }
         for row in rows
     }

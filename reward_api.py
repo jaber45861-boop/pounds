@@ -19,6 +19,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
@@ -390,7 +391,8 @@ def register_reward_api(
         if not isinstance(services, list):
             return jsonify({"status": "error", "message": "Invalid response from SMMCPAN", "raw": services}), 502
 
-        margin = smm_margin_pct / 100.0  # e.g. 30 → 0.30
+        margin_decimal = Decimal(str(smm_margin_pct)) / Decimal("100")  # e.g. 30 → 0.30
+        egp_per_usd_decimal = Decimal(str(egp_per_usd))
 
         filtered = []
         for svc in services:
@@ -404,14 +406,21 @@ def register_reward_api(
                 continue
 
             # Assumption: SMMCPAN rate is USD per 1000 units, following standard SMM panel convention.
-            # Verify against provider documentation/support before production pricing.
-            rate_usd = float(svc.get("rate", 0))
-            cost_per_1k_egp = rate_usd * egp_per_usd
-            cost_per_unit_egp = cost_per_1k_egp / 1000.0
+            # All arithmetic uses Decimal — no float money path.
+            rate_usd_decimal = Decimal(str(svc.get("rate", 0)))
+            cost_per_1k_egp = rate_usd_decimal * egp_per_usd_decimal
+            cost_per_unit_egp = cost_per_1k_egp / Decimal("1000")
             # Apply margin: selling price = cost / (1 - margin)
-            sell_price_egp = cost_per_unit_egp / (1 - margin) if margin < 1 else cost_per_unit_egp
+            if margin_decimal < 1:
+                sell_price_egp = cost_per_unit_egp / (Decimal("1") - margin_decimal)
+            else:
+                sell_price_egp = cost_per_unit_egp
             # Convert to cents for the balance_cents system
-            sell_price_cents = int(round(sell_price_egp * 100))
+            sell_price_cents = int(
+                (sell_price_egp * Decimal("100")).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            )
 
             filtered.append({
                 "service_id": svc.get("service"),
@@ -419,9 +428,11 @@ def register_reward_api(
                 "category": svc.get("category"),
                 "min_quantity": svc.get("min"),
                 "max_quantity": svc.get("max"),
-                "rate_per_1k_usd": rate_usd,
+                "rate_per_1k_usd": float(rate_usd_decimal),
                 "sell_price_cents": sell_price_cents,
-                "sell_price_egp": round(sell_price_egp, 2),
+                "sell_price_egp": float(sell_price_egp.quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )),
             })
 
         return jsonify({
