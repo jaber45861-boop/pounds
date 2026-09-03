@@ -162,6 +162,136 @@ REQUIRED_CHANNELS: list[dict] = [dict(channel) for channel in BASE_REQUIRED_CHAN
 SPONSOR_CHANNEL   = BASE_REQUIRED_CHANNELS[0]["username"]
 # ← مكافأة إضافية تُمنح مرة واحدة فقط عند أول تفعيل للحساب
 ACTIVATION_REWARD = 50
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── USD Nano Money Primitives (Phase 1) ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 1 USD = 1,000,000,000 USD nano-units (10^9).
+# Stored as SQLite INTEGER.  Arithmetic uses Decimal exclusively.
+# These primitives are NOT wired into existing EGP-cent accounting yet.
+
+USD_NANO_PER_USD = 1_000_000_000
+USD_NANO_SCALE   = Decimal("1000000000")
+
+
+def usd_decimal_to_nano(amount) -> int:
+    """Convert a USD Decimal/string value to integer USD nano-units.
+
+    Uses ROUND_HALF_UP quantization.  Rejects NaN, Infinity, and
+    non-finite values.  Returns 0 for zero input.
+    """
+    try:
+        d = Decimal(str(amount).strip())
+    except (InvalidOperation, ValueError, TypeError, AttributeError):
+        raise ValueError(f"Cannot convert {amount!r} to Decimal")
+    if d.is_nan() or d.is_infinite():
+        raise ValueError(f"Non-finite value: {d}")
+    if d < 0:
+        raise ValueError(f"Negative USD amount not supported: {d}")
+    return int((d * USD_NANO_SCALE).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def nano_to_usd_decimal(nano: int | float | str | Decimal) -> Decimal:
+    """Convert integer USD nano-units back to a USD Decimal."""
+    try:
+        n = int(nano)
+    except (ValueError, TypeError):
+        raise ValueError(f"Cannot convert {nano!r} to int")
+    if n < 0:
+        raise ValueError(f"Negative nano amount not supported: {n}")
+    return (Decimal(n) / USD_NANO_SCALE).quantize(
+        Decimal("0.000000001"), rounding=ROUND_HALF_UP
+    )
+
+
+def egp_decimal_to_usd_nano(egp_amount, rate=None) -> int:
+    """Convert an EGP Decimal amount to USD nano-units via a given rate.
+
+    ``rate`` is EGP per 1 USD (Decimal).  Defaults to EGP_PER_USD.
+    This is a pure helper for future migration — not wired into accounting.
+    """
+    if rate is None:
+        rate = EGP_PER_USD
+    try:
+        egp = Decimal(str(egp_amount).strip())
+    except (InvalidOperation, ValueError, TypeError, AttributeError):
+        raise ValueError(f"Cannot convert {egp_amount!r} to Decimal")
+    if egp.is_nan() or egp.is_infinite():
+        raise ValueError(f"Non-finite EGP value: {egp}")
+    usd = egp / Decimal(str(rate))
+    return usd_decimal_to_nano(usd)
+
+
+def usd_nano_to_egp_decimal(nano: int, rate=None) -> Decimal:
+    """Convert USD nano-units to an EGP Decimal via a given rate.
+
+    ``rate`` is EGP per 1 USD (Decimal).  Defaults to EGP_PER_USD.
+    This is a pure helper for future migration — not wired into accounting.
+    """
+    if rate is None:
+        rate = EGP_PER_USD
+    usd = nano_to_usd_decimal(nano)
+    egp = usd * Decimal(str(rate))
+    return egp.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def format_usd_nano(nano: int) -> str:
+    """Format integer USD nano-units as a human-readable USD string.
+
+    Preserves sub-cent precision without unnecessary trailing zeros.
+    Avoids scientific notation (e.g. '1E-9') by using fixed-width
+    format for sub-cent values.
+    """
+    d = nano_to_usd_decimal(nano)
+    if d == 0:
+        return "$0"
+    if d < Decimal("0.01"):
+        # For sub-cent values, format with up to 9 decimal places,
+        # stripping trailing zeros but never using scientific notation.
+        # e.g. 1 → "$0.000000001", 5000000 → "$0.005"
+        normalized = d.normalize()
+        # If normalize() produced scientific notation, use fixed format
+        text = str(normalized)
+        if "E" in text or "e" in text:
+            text = f"{d:f}"
+        # Strip trailing zeros after decimal point
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return f"${text}"
+    # For >= $0.01, normalize and remove unnecessary trailing zeros
+    normalized = d.normalize()
+    return f"${normalized}"
+
+
+def is_valid_usd_nano_amount(value) -> bool:
+    """Return True if *value* can be safely stored as a USD nano-integer.
+
+    Accepts int, Decimal, str, or float (float only for zero/non-zero
+    check — never used as authoritative money value).
+    """
+    try:
+        if isinstance(value, float):
+            if value != value or value == float("inf") or value == float("-inf"):
+                return False
+            # float is accepted but only for convenience; convert via Decimal
+            value = str(value)
+        n = usd_decimal_to_nano(value)
+        return 0 <= n <= 2**63 - 1  # SQLite INTEGER range
+    except (ValueError, OverflowError):
+        return False
+
+
+def require_valid_usd_nano_amount(value) -> int:
+    """Like ``usd_decimal_to_nano`` but also checks SQLite INTEGER range.
+
+    Raises ``ValueError`` for invalid, negative, or overflow values.
+    """
+    n = usd_decimal_to_nano(value)
+    if n < 0:
+        raise ValueError(f"Negative nano amount: {n}")
+    if n > 2**63 - 1:
+        raise ValueError(f"Nano amount exceeds SQLite INTEGER max: {n}")
+    return n
 WITHDRAWAL_COOLDOWN_MESSAGE = (
     "⚠️ تنبيه: مسموح بطلب سحب واحد فقط كل 24 ساعة لمنع الضغط! "
     "يمكنك تقديم طلب جديد غداً."
