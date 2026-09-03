@@ -1,4 +1,4 @@
-"""Tests for USD nano money primitives (Phase 1).
+"""Tests for USD nano money primitives (Phase 1 + boundary hardening).
 
 Covers:
 - usd_decimal_to_nano / nano_to_usd_decimal
@@ -7,6 +7,10 @@ Covers:
 - is_valid_usd_nano_amount / require_valid_usd_nano_amount
 - Round-trip fidelity
 - Existing EGP-cent helpers remain unchanged
+- FIX 1: strict float rejection in usd_decimal_to_nano
+- FIX 2: strict integer-only in nano_to_usd_decimal
+- FIX 3: rate validation in EGP/USD helpers
+- FIX 4: format_usd_nano display convention
 """
 import os
 import sys
@@ -123,6 +127,23 @@ class TestUsdDecimalToNano(unittest.TestCase):
         with self.assertRaises(ValueError):
             usd_decimal_to_nano("")
 
+    # ── FIX 1: Strict float rejection ────────────────────────────────────────
+
+    def test_float_rejected(self):
+        """FIX 1: usd_decimal_to_nano must reject float input."""
+        with self.assertRaises(TypeError):
+            usd_decimal_to_nano(0.005)
+
+    def test_float_zero_rejected(self):
+        """FIX 1: even float(0.0) must be rejected."""
+        with self.assertRaises(TypeError):
+            usd_decimal_to_nano(0.0)
+
+    def test_float_one_rejected(self):
+        """FIX 1: float(1.0) must be rejected."""
+        with self.assertRaises(TypeError):
+            usd_decimal_to_nano(1.0)
+
 
 class TestNanoToUsdDecimal(unittest.TestCase):
     """nano → USD conversion tests."""
@@ -151,6 +172,56 @@ class TestNanoToUsdDecimal(unittest.TestCase):
     def test_negative_raises(self):
         with self.assertRaises(ValueError):
             nano_to_usd_decimal(-1)
+
+    # ── FIX 2: Strict integer-only storage boundary ──────────────────────────
+
+    def test_float_rejected(self):
+        """FIX 2: nano_to_usd_decimal must reject float."""
+        with self.assertRaises(TypeError):
+            nano_to_usd_decimal(1.5)
+
+    def test_float_zero_rejected(self):
+        """FIX 2: even float(0.0) must be rejected."""
+        with self.assertRaises(TypeError):
+            nano_to_usd_decimal(0.0)
+
+    def test_fractional_decimal_rejected(self):
+        """FIX 2: Decimal(\"1.5\") must be rejected."""
+        with self.assertRaises(ValueError):
+            nano_to_usd_decimal(Decimal("1.5"))
+
+    def test_fractional_string_rejected(self):
+        """FIX 2: \"1.5\" must be rejected."""
+        with self.assertRaises(ValueError):
+            nano_to_usd_decimal("1.5")
+
+    def test_none_rejected(self):
+        """FIX 2: None must be rejected."""
+        with self.assertRaises(ValueError):
+            nano_to_usd_decimal(None)
+
+    def test_nan_decimal_rejected(self):
+        """FIX 2: Decimal(\"NaN\") must be rejected."""
+        with self.assertRaises(ValueError):
+            nano_to_usd_decimal(Decimal("NaN"))
+
+    def test_inf_string_rejected(self):
+        """FIX 2: \"Infinity\" must be rejected."""
+        with self.assertRaises((ValueError, OverflowError)):
+            nano_to_usd_decimal("Infinity")
+
+    def test_integer_decimal_accepted(self):
+        """FIX 2: Decimal(\"5\") (integer-valued) should be accepted."""
+        self.assertEqual(nano_to_usd_decimal(Decimal("5")), Decimal("0.000000005"))
+
+    def test_integer_string_accepted(self):
+        """FIX 2: \"5\" (integer string) should be accepted."""
+        self.assertEqual(nano_to_usd_decimal("5"), Decimal("0.000000005"))
+
+    def test_empty_string_rejected(self):
+        """FIX 2: empty string must be rejected."""
+        with self.assertRaises(ValueError):
+            nano_to_usd_decimal("")
 
 
 class TestRoundTrip(unittest.TestCase):
@@ -190,27 +261,22 @@ class TestEgpUsdNanoConversion(unittest.TestCase):
     """EGP ↔ USD-nano conversion tests."""
 
     def test_egp_50_to_usd_nano_at_rate_50(self):
-        # 50 EGP / 50 = $1.00 = 1,000,000,000 nano
         nano = egp_decimal_to_usd_nano(Decimal("50"), rate=Decimal("50"))
         self.assertEqual(nano, 1_000_000_000)
 
     def test_egp_5_to_usd_nano_at_rate_50(self):
-        # 5 EGP / 50 = $0.10 = 100,000,000 nano
         nano = egp_decimal_to_usd_nano(Decimal("5"), rate=Decimal("50"))
         self.assertEqual(nano, 100_000_000)
 
     def test_egp_0_50_to_usd_nano_at_rate_50(self):
-        # 0.50 EGP / 50 = $0.01 = 10,000,000 nano
         nano = egp_decimal_to_usd_nano(Decimal("0.50"), rate=Decimal("50"))
         self.assertEqual(nano, 10_000_000)
 
     def test_usd_nano_to_egp_at_rate_50(self):
-        # 1,000,000,000 nano = $1.00 × 50 = 50.00 EGP
         egp = usd_nano_to_egp_decimal(1_000_000_000, rate=Decimal("50"))
         self.assertEqual(egp, Decimal("50.00"))
 
     def test_usd_nano_to_egp_at_rate_51(self):
-        # 100,000,000 nano = $0.10 × 51 = 5.10 EGP
         egp = usd_nano_to_egp_decimal(100_000_000, rate=Decimal("51"))
         self.assertEqual(egp, Decimal("5.10"))
 
@@ -224,11 +290,9 @@ class TestEgpUsdNanoConversion(unittest.TestCase):
         egp = Decimal("10.20")
         nano = egp_decimal_to_usd_nano(egp, rate=Decimal("51"))
         result = usd_nano_to_egp_decimal(nano, rate=Decimal("51"))
-        # 10.20 / 51 = $0.20 = 200000000 nano → $0.20 × 51 = 10.20
         self.assertEqual(result, egp)
 
     def test_default_rate_is_50(self):
-        # Without explicit rate, should use EGP_PER_USD = 50
         nano = egp_decimal_to_usd_nano(Decimal("50"))
         self.assertEqual(nano, 1_000_000_000)
 
@@ -236,12 +300,80 @@ class TestEgpUsdNanoConversion(unittest.TestCase):
         nano = egp_decimal_to_usd_nano(Decimal("0"), rate=Decimal("50"))
         self.assertEqual(nano, 0)
 
+    # ── FIX 3: Rate validation tests ─────────────────────────────────────────
+
+    def test_rate_zero_rejected(self):
+        """FIX 3: rate=0 must be rejected."""
+        with self.assertRaises(ValueError):
+            egp_decimal_to_usd_nano(Decimal("50"), rate=Decimal("0"))
+
+    def test_rate_negative_rejected(self):
+        """FIX 3: negative rate must be rejected."""
+        with self.assertRaises(ValueError):
+            egp_decimal_to_usd_nano(Decimal("50"), rate=Decimal("-50"))
+
+    def test_rate_nan_rejected(self):
+        """FIX 3: NaN rate must be rejected."""
+        with self.assertRaises(ValueError):
+            egp_decimal_to_usd_nano(Decimal("50"), rate=Decimal("NaN"))
+
+    def test_rate_infinity_rejected(self):
+        """FIX 3: Infinity rate must be rejected."""
+        with self.assertRaises(ValueError):
+            egp_decimal_to_usd_nano(Decimal("50"), rate=Decimal("Infinity"))
+
+    def test_rate_zero_rejected_reverse(self):
+        """FIX 3: rate=0 must be rejected in reverse conversion too."""
+        with self.assertRaises(ValueError):
+            usd_nano_to_egp_decimal(1_000_000_000, rate=Decimal("0"))
+
+    def test_rate_negative_rejected_reverse(self):
+        """FIX 3: negative rate must be rejected in reverse conversion."""
+        with self.assertRaises(ValueError):
+            usd_nano_to_egp_decimal(1_000_000_000, rate=Decimal("-50"))
+
+    def test_rate_nan_rejected_reverse(self):
+        """FIX 3: NaN rate must be rejected in reverse conversion."""
+        with self.assertRaises(ValueError):
+            usd_nano_to_egp_decimal(1_000_000_000, rate=Decimal("NaN"))
+
+    def test_rate_infinity_rejected_reverse(self):
+        """FIX 3: Infinity rate must be rejected in reverse conversion."""
+        with self.assertRaises(ValueError):
+            usd_nano_to_egp_decimal(1_000_000_000, rate=Decimal("Infinity"))
+
+    def test_rate_decimal_accepted(self):
+        """FIX 3: a valid Decimal rate like 48.75 should work."""
+        nano = egp_decimal_to_usd_nano(Decimal("48.75"), rate=Decimal("48.75"))
+        self.assertEqual(nano, 1_000_000_000)
+
+    def test_rate_float_rejected(self):
+        """FIX 3: float rate must be rejected (via Decimal conversion)."""
+        with self.assertRaises((ValueError, TypeError)):
+            egp_decimal_to_usd_nano(Decimal("50"), rate=50.0)
+
 
 class TestFormatUsdNano(unittest.TestCase):
-    """USD nano formatting tests."""
+    """USD nano formatting tests — FIX 4 display convention."""
+
+    # ── Values >= $0.01: exactly two decimal places ──────────────────────────
 
     def test_format_one_cent(self):
         self.assertEqual(format_usd_nano(10_000_000), "$0.01")
+
+    def test_format_10_cents(self):
+        self.assertEqual(format_usd_nano(100_000_000), "$0.10")
+
+    def test_format_one_dollar(self):
+        self.assertEqual(format_usd_nano(1_000_000_000), "$1.00")
+
+    def test_format_large(self):
+        self.assertEqual(format_usd_nano(125_300_000_000), "$125.30")
+
+    def test_format_1_50(self):
+        self.assertEqual(format_usd_nano(1_500_000_000), "$1.50")
+
+    # ── Values > 0 and < $0.01: exact representation, no trailing zeros ──────
 
     def test_format_half_cent(self):
         self.assertEqual(format_usd_nano(5_000_000), "$0.005")
@@ -252,18 +384,14 @@ class TestFormatUsdNano(unittest.TestCase):
     def test_format_one_nano_unit(self):
         self.assertEqual(format_usd_nano(1), "$0.000000001")
 
-    def test_format_one_dollar(self):
-        self.assertEqual(format_usd_nano(1_000_000_000), "$1")
+    def test_format_25_cents_subcent(self):
+        # 2,500,000 nano = $0.0025
+        self.assertEqual(format_usd_nano(2_500_000), "$0.0025")
+
+    # ── Zero ──────────────────────────────────────────────────────────────────
 
     def test_format_zero(self):
-        self.assertEqual(format_usd_nano(0), "$0")
-
-    def test_format_10_cents(self):
-        self.assertEqual(format_usd_nano(100_000_000), "$0.1")
-
-    def test_format_large(self):
-        result = format_usd_nano(1_500_000_000)
-        self.assertEqual(result, "$1.5")
+        self.assertEqual(format_usd_nano(0), "$0.00")
 
 
 class TestValidation(unittest.TestCase):
@@ -300,8 +428,6 @@ class TestValidation(unittest.TestCase):
         self.assertTrue(is_valid_usd_nano_amount(0.0))
 
     def test_overflow_raises(self):
-        # SQLite max is 2^63 - 1 = 9223372036854775807
-        # That's $9.22... — anything that nano-converts beyond that is invalid
         with self.assertRaises((ValueError, OverflowError)):
             require_valid_usd_nano_amount(Decimal("10000000000"))
 
@@ -329,11 +455,9 @@ class TestExistingEgpCentHelpersUnchanged(unittest.TestCase):
         self.assertEqual(gb.format_egp(0), "0.00 جنيه")
 
     def test_format_usd_basic(self):
-        # 100 EGP cents = 1 EGP = $0.02 at EGP_PER_USD=50
         self.assertEqual(gb.format_usd(100), "$0.02")
 
     def test_format_balance_basic(self):
-        # 100 EGP cents = 1 EGP = $0.02 at EGP_PER_USD=50
         self.assertEqual(gb.format_balance(100), "1.00 جنيه ($0.02)")
 
     def test_format_balance_zero(self):
@@ -352,7 +476,6 @@ class TestExistingEgpCentHelpersUnchanged(unittest.TestCase):
         self.assertEqual(gb.parse_currency_input("50"), 5000)
 
     def test_parse_currency_input_usd(self):
-        # $1 = 50 EGP = 5000 cents
         self.assertEqual(gb.parse_currency_input("$1"), 5000)
 
     def test_calculate_selling_price_10_pounds(self):

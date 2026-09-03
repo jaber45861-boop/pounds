@@ -177,9 +177,15 @@ USD_NANO_SCALE   = Decimal("1000000000")
 def usd_decimal_to_nano(amount) -> int:
     """Convert a USD Decimal/string value to integer USD nano-units.
 
-    Uses ROUND_HALF_UP quantization.  Rejects NaN, Infinity, and
-    non-finite values.  Returns 0 for zero input.
+    Accepts Decimal, str, and int.  Rejects float, NaN, Infinity,
+    -Infinity, invalid strings, and None.
+    Uses ROUND_HALF_UP quantization.  Returns 0 for zero input.
     """
+    if isinstance(amount, float):
+        raise TypeError(
+            f"float input rejected for money primitive: {amount!r}. "
+            "Use Decimal or a decimal string instead."
+        )
     try:
         d = Decimal(str(amount).strip())
     except (InvalidOperation, ValueError, TypeError, AttributeError):
@@ -191,11 +197,47 @@ def usd_decimal_to_nano(amount) -> int:
     return int((d * USD_NANO_SCALE).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def nano_to_usd_decimal(nano: int | float | str | Decimal) -> Decimal:
-    """Convert integer USD nano-units back to a USD Decimal."""
-    try:
+def nano_to_usd_decimal(nano) -> Decimal:
+    """Convert integer USD nano-units back to a USD Decimal.
+
+    Accepts ONLY an actual integer storage value (int).
+    Rejects float, fractional Decimal, fractional strings, None,
+    NaN, Infinity, and negative values.
+    """
+    if isinstance(nano, float):
+        raise TypeError(
+            f"float input rejected for nano storage: {nano!r}. "
+            "Use an integer nano value instead."
+        )
+    if isinstance(nano, bool):
+        # bool is a subclass of int; accept True/False as 1/0
         n = int(nano)
-    except (ValueError, TypeError):
+    elif isinstance(nano, int):
+        n = nano
+    elif isinstance(nano, Decimal):
+        # Reject fractional Decimals (e.g. Decimal("1.5"))
+        if nano != nano.to_integral_value():
+            raise ValueError(
+                f"Fractional Decimal rejected for nano storage: {nano!r}. "
+                "Use an integer nano value instead."
+            )
+        n = int(nano)
+    elif isinstance(nano, str):
+        # Reject fractional strings
+        stripped = nano.strip()
+        if stripped == "":
+            raise ValueError(f"Cannot convert empty string to int")
+        try:
+            as_decimal = Decimal(stripped)
+        except InvalidOperation:
+            raise ValueError(f"Cannot convert {nano!r} to int")
+        if as_decimal != as_decimal.to_integral_value():
+            raise ValueError(
+                f"Fractional string rejected for nano storage: {nano!r}. "
+                "Use an integer nano value instead."
+            )
+        n = int(as_decimal)
+    else:
         raise ValueError(f"Cannot convert {nano!r} to int")
     if n < 0:
         raise ValueError(f"Negative nano amount not supported: {n}")
@@ -204,21 +246,44 @@ def nano_to_usd_decimal(nano: int | float | str | Decimal) -> Decimal:
     )
 
 
+def _validate_egp_rate(rate) -> Decimal:
+    """Validate and return a Decimal EGP-per-USD rate.
+
+    Rate must be a finite Decimal strictly greater than zero.
+    Rejects float to prevent binary floating-point contamination.
+    """
+    if isinstance(rate, float):
+        raise TypeError(
+            f"float rate rejected: {rate!r}. Use Decimal instead."
+        )
+    try:
+        r = Decimal(str(rate))
+    except (InvalidOperation, ValueError, TypeError, AttributeError):
+        raise ValueError(f"Cannot convert rate {rate!r} to Decimal")
+    if r.is_nan() or r.is_infinite():
+        raise ValueError(f"Non-finite rate: {r}")
+    if r <= 0:
+        raise ValueError(f"Rate must be strictly positive, got {r}")
+    return r
+
+
 def egp_decimal_to_usd_nano(egp_amount, rate=None) -> int:
     """Convert an EGP Decimal amount to USD nano-units via a given rate.
 
     ``rate`` is EGP per 1 USD (Decimal).  Defaults to EGP_PER_USD.
+    Rate must be finite and strictly positive.
     This is a pure helper for future migration — not wired into accounting.
     """
     if rate is None:
         rate = EGP_PER_USD
+    r = _validate_egp_rate(rate)
     try:
         egp = Decimal(str(egp_amount).strip())
     except (InvalidOperation, ValueError, TypeError, AttributeError):
         raise ValueError(f"Cannot convert {egp_amount!r} to Decimal")
     if egp.is_nan() or egp.is_infinite():
         raise ValueError(f"Non-finite EGP value: {egp}")
-    usd = egp / Decimal(str(rate))
+    usd = egp / r
     return usd_decimal_to_nano(usd)
 
 
@@ -226,41 +291,38 @@ def usd_nano_to_egp_decimal(nano: int, rate=None) -> Decimal:
     """Convert USD nano-units to an EGP Decimal via a given rate.
 
     ``rate`` is EGP per 1 USD (Decimal).  Defaults to EGP_PER_USD.
+    Rate must be finite and strictly positive.
     This is a pure helper for future migration — not wired into accounting.
     """
     if rate is None:
         rate = EGP_PER_USD
+    r = _validate_egp_rate(rate)
     usd = nano_to_usd_decimal(nano)
-    egp = usd * Decimal(str(rate))
+    egp = usd * r
     return egp.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def format_usd_nano(nano: int) -> str:
     """Format integer USD nano-units as a human-readable USD string.
 
-    Preserves sub-cent precision without unnecessary trailing zeros.
-    Avoids scientific notation (e.g. '1E-9') by using fixed-width
-    format for sub-cent values.
+    Display policy:
+      - Zero:       "$0.00"
+      - >= $0.01:   two decimal places (e.g. "$0.01", "$1.00", "$125.30")
+      - 0 < x < $0.01: enough decimals to show exact nano value, up to 9,
+        with trailing zeros stripped (e.g. "$0.005", "$0.000001").
     """
     d = nano_to_usd_decimal(nano)
     if d == 0:
-        return "$0"
+        return "$0.00"
     if d < Decimal("0.01"):
-        # For sub-cent values, format with up to 9 decimal places,
-        # stripping trailing zeros but never using scientific notation.
-        # e.g. 1 → "$0.000000001", 5000000 → "$0.005"
-        normalized = d.normalize()
-        # If normalize() produced scientific notation, use fixed format
-        text = str(normalized)
-        if "E" in text or "e" in text:
-            text = f"{d:f}"
-        # Strip trailing zeros after decimal point
+        # Sub-cent: show exact value up to 9 decimals, strip trailing zeros.
+        # Use fixed-point to avoid scientific notation.
+        text = f"{d:f}"
         if "." in text:
             text = text.rstrip("0").rstrip(".")
         return f"${text}"
-    # For >= $0.01, normalize and remove unnecessary trailing zeros
-    normalized = d.normalize()
-    return f"${normalized}"
+    # >= $0.01: always exactly two decimal places
+    return f"${d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
 
 
 def is_valid_usd_nano_amount(value) -> bool:
