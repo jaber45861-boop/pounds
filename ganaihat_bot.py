@@ -125,7 +125,7 @@ CPAGRIP_RSS_URL         = "https://www.cpagrip.com/common/offer_feed_rss.php"
 REFERRAL_SERVICE_KEY = "referral_boost"
 REFERRAL_COST = 500
 REFERRAL_QUANTITY = 25
-REFERRAL_REWARD = 50  # 0.50 جنيه = 50 قرشاً
+REFERRAL_REWARD = 1   # 0.01 جنيه ($0.01) – مكافأة إحالة م팎رة عند تفعيل الحساب
 WITHDRAWAL_MIN_POINTS = 5000
 DEFAULT_ORDER_MIN_POINTS = 100
 ABSOLUTE_ORDER_MIN_POINTS = 1
