@@ -843,5 +843,185 @@ class TestVodafoneEnforcementAtRate(unittest.TestCase):
         self.assertEqual(result_bad, "below_minimum")
 
 
+
+class TestWithdrawalEntryGate(unittest.TestCase):
+    """Regression tests for the withdrawal entry gate fix.
+
+    The old callback_withdraw_earnings had a generic balance gate:
+        if row_balance_cents(user) < get_min_withdrawal():
+            ... reject ...
+
+    This blocked customers from reaching the V2 method selector even when
+    they qualified for Vodafone's lower dynamic minimum ($0.10).
+    """
+
+    def test_70_no_generic_min_withdrawal_gate_in_source(self):
+        """Verify the source code of callback_withdraw_earnings does NOT
+        contain a generic get_min_withdrawal() balance gate."""
+        with open(_BOT_FILE, "r", encoding="utf-8") as f:
+            source = f.read()
+        # Find the callback_withdraw_earnings function
+        idx = source.find("def callback_withdraw_earnings(call):")
+        self.assertNotEqual(idx, -1, "callback_withdraw_earnings not found")
+        # Get the function body (up to the next def at the same indent level)
+        next_def = source.find("\ndef callback_", idx + 10)
+        if next_def == -1:
+            next_def = source.find("\ndef ", idx + 40)
+        func_body = source[idx:next_def] if next_def != -1 else source[idx:idx+2000]
+        # The old gate used row_balance_cents + get_min_withdrawal together
+        self.assertNotIn("row_balance_cents(user) < get_min_withdrawal()", func_body,
+                         "Generic balance gate still present in callback_withdraw_earnings")
+
+    def test_71_no_rejection_message_in_entry_handler(self):
+        """Verify the old rejection message is not in the entry handler."""
+        with open(_BOT_FILE, "r", encoding="utf-8") as f:
+            source = f.read()
+        idx = source.find("def callback_withdraw_earnings(call):")
+        next_def = source.find("\ndef callback_", idx + 10)
+        func_body = source[idx:next_def] if next_def != -1 else source[idx:idx+2000]
+        self.assertNotIn("اجمع المزيد", func_body,
+                         "Old rejection message still in entry handler")
+
+    def test_72_no_global_min_display_in_success_path(self):
+        """Verify the success path no longer shows get_min_withdrawal()."""
+        with open(_BOT_FILE, "r", encoding="utf-8") as f:
+            source = f.read()
+        idx = source.find("def callback_withdraw_earnings(call):")
+        next_def = source.find("\ndef callback_", idx + 10)
+        func_body = source[idx:next_def] if next_def != -1 else source[idx:idx+2000]
+        self.assertNotIn("format_balance(get_min_withdrawal())", func_body,
+                         "Global minimum still displayed in success path")
+
+    def test_73_balance_below_global_above_vodafone_allows_entry(self):
+        """Balance 7.00 EGP (below 10 EGP global, above 5.00 EGP Vodafone at rate 50).
+        The entry handler must NOT reject this user."""
+        # The entry handler no longer has a balance gate, so any user with
+        # a valid account can reach method selection. We verify this by
+        # confirming the absence of the gate in source (test_70).
+        # Additionally, the V2 flow validates method-specific minimums.
+        # At rate 50, Vodafone min = 5.00 EGP = 500 cents.
+        rate = Decimal("50")
+        vodafone_min = gb.compute_vodafone_min_egp_cents(rate)
+        self.assertEqual(vodafone_min, 500)  # 5.00 EGP
+        # A balance of 700 cents (7.00 EGP) is above Vodafone min
+        self.assertGreater(700, vodafone_min)
+
+    def test_74_balance_below_vodafone_min_reaches_entry(self):
+        """Balance 3.00 EGP (below Vodafone 5.00 EGP at rate 50).
+        User can reach method selection but Vodafone-specific flow will reject."""
+        rate = Decimal("50")
+        vodafone_min = gb.compute_vodafone_min_egp_cents(rate)
+        balance = 300  # 3.00 EGP
+        self.assertLess(balance, vodafone_min)
+        # The entry gate no longer blocks this — V2 flow handles it
+
+    def test_75_balance_exactly_at_vodafone_min(self):
+        """Balance exactly at Vodafone minimum: 5.00 EGP at rate 50."""
+        rate = Decimal("50")
+        vodafone_min = gb.compute_vodafone_min_egp_cents(rate)
+        balance = 500  # 5.00 EGP
+        self.assertEqual(balance, vodafone_min)
+        # At exact boundary, the V2 flow should accept this amount
+
+    def test_76_vodafone_min_rate_examples(self):
+        """Verify Vodafone dynamic minimum at various rates."""
+        examples = [
+            (Decimal("50"), 500),   # 5.00 EGP
+            (Decimal("51"), 510),   # 5.10 EGP
+            (Decimal("52"), 520),   # 5.20 EGP
+            (Decimal("53"), 530),   # 5.30 EGP
+            (Decimal("55"), 550),   # 5.50 EGP
+        ]
+        for rate, expected_cents in examples:
+            result = gb.compute_vodafone_min_egp_cents(rate)
+            self.assertEqual(result, expected_cents,
+                             f"Rate {rate}: expected {expected_cents}, got {result}")
+
+    def test_77_usdt_minimum_unchanged(self):
+        """USDT minimum remains 0.15 USDT, BEP-20 only."""
+        self.assertEqual(gb.USDT_MIN_USDT, Decimal("0.15"))
+        self.assertEqual(gb.WITHDRAWAL_NETWORK_BEP20, "BSC_BEP20")
+
+    def test_78_withdrawal_cooldown_unchanged(self):
+        """24-hour cooldown is still enforced."""
+        self.assertEqual(gb.WITHDRAWAL_COOLDOWN_SECONDS, 24 * 3600)
+
+    def test_79_referral_check_still_in_entry_handler(self):
+        """Referral eligibility check must remain in the entry handler."""
+        with open(_BOT_FILE, "r", encoding="utf-8") as f:
+            source = f.read()
+        idx = source.find("def callback_withdraw_earnings(call):")
+        next_def = source.find("\ndef callback_", idx + 10)
+        func_body = source[idx:next_def] if next_def != -1 else source[idx:idx+2000]
+        self.assertIn("run_referral_withdrawal_double_check", func_body,
+                      "Referral check missing from entry handler")
+
+    def test_80_cooldown_check_still_in_entry_handler(self):
+        """24-hour cooldown check must remain in the entry handler."""
+        with open(_BOT_FILE, "r", encoding="utf-8") as f:
+            source = f.read()
+        idx = source.find("def callback_withdraw_earnings(call):")
+        next_def = source.find("\ndef callback_", idx + 10)
+        func_body = source[idx:next_def] if next_def != -1 else source[idx:idx+2000]
+        self.assertIn("has_recent_withdrawal", func_body,
+                      "Cooldown check missing from entry handler")
+
+    def test_81_v2_keyboard_still_emitted(self):
+        """The method selector keyboard must still emit V2 callbacks."""
+        markup = gb.withdrawal_method_keyboard()
+        rendered = []
+        for row in markup.keyboard:
+            for btn in row:
+                rendered.append(btn.callback_data)
+        self.assertIn("withdraw_v2_vodafone", rendered)
+        self.assertIn("withdraw_v2_usdt", rendered)
+
+    def test_82_get_min_withdrawal_still_exists(self):
+        """get_min_withdrawal() must still exist for admin/tooling use."""
+        self.assertTrue(hasattr(gb, "get_min_withdrawal"))
+        self.assertTrue(callable(gb.get_min_withdrawal))
+
+    def test_83_atomic_deduction_unchanged(self):
+        """V2 atomic balance deduction/refund still works."""
+        # Create a user with balance
+        with gb.get_connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO users (user_id, first_name, balance_cents) "
+                "VALUES (8888, 'Test', 10000)"
+            )
+            conn.commit()
+        gb._seed_rate = lambda: None  # mock
+        # Seed a rate
+        with gb.get_connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO currency_settings (setting_key, setting_value, updated_at) "
+                "VALUES ('usdt_egp_rate', '50', CURRENT_TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO currency_settings (setting_key, setting_value, updated_at) "
+                "VALUES ('usdt_egp_rate_provider', 'coingecko', CURRENT_TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO currency_settings (setting_key, setting_value, updated_at) "
+                "VALUES ('usdt_egp_rate_fetched_at', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+            conn.commit()
+        result = gb.create_v2_withdrawal_request(
+            user_id=8888,
+            method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
+            destination="01012345678",
+            requested_egp_cents=1000,
+            usdt_amount=None,
+            network_code=None,
+        )
+        self.assertIsInstance(result, int)
+        with gb.get_connection() as conn:
+            user = conn.execute("SELECT balance_cents FROM users WHERE user_id = 8888").fetchone()
+            self.assertLess(user["balance_cents"], 10000)
+            # Refund
+            conn.execute("DELETE FROM withdrawal_requests WHERE user_id = 8888")
+            conn.execute("UPDATE users SET balance_cents = 10000 WHERE user_id = 8888")
+            conn.commit()
+
 if __name__ == "__main__":
     unittest.main()

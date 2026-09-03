@@ -10,15 +10,17 @@ os.environ.setdefault("API_SECRET", "")
 os.environ.setdefault("SESSION_SECRET", "")
 os.environ.setdefault("EGP_PER_USD_SMM", "50")
 
-sys.path.insert(0, "/root/pounds")
-
 import decimal as _decimal
 import importlib.util
 import sys as _sys
 
+# Portable project-relative path: tests/ lives next to ganaihat_bot.py
+_BOT_FILE = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ganaihat_bot.py")
+)
 _spec = importlib.util.spec_from_file_location(
     "ganaihat_bot",
-    "/root/pounds/ganaihat_bot.py",
+    _BOT_FILE,
     submodule_search_locations=[],
 )
 _mod = importlib.util.module_from_spec(_spec)

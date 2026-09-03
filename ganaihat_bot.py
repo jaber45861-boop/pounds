@@ -7148,28 +7148,11 @@ def callback_withdraw_earnings(call):
         )
         return
 
-    if row_balance_cents(user) < get_min_withdrawal():
-        bot.answer_callback_query(call.id)
-        bot.edit_message_text(
-            "عذراً، الحد الأدنى لسحب الأرباح هو "
-            f"{format_balance(get_min_withdrawal())}. اجمع المزيد وحاول مجدداً! 🚀",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "🏠 القائمة الرئيسية",
-                    callback_data="back_main",
-                ),
-            ]]),
-        )
-        return
-
     bot.answer_callback_query(call.id)
     bot.edit_message_text(
         f"💰 <b>سحب الأرباح</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"رصيدك الحالي: <b>{balance_text(user)}</b>\n"
-        f"الحد الأدنى للسحب: <b>{format_balance(get_min_withdrawal())}</b>\n\n"
         "اختر طريقة السحب:",
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
