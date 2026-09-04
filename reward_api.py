@@ -28,19 +28,20 @@ from flask import Flask, jsonify, request
 
 logger = logging.getLogger("telegram_reward_api")
 
-# Shared EGP/USD reference rate for live accounting conversions.
-EGP_PER_USD_REF = Decimal("50")
+# Live EGP/USD rate — set from register_reward_api() parameter.
+# NOT a migration rate. Used for live EGP-cent → USD-nano conversions.
+_live_egp_per_usd: Decimal = Decimal("50")
 
 
 def _egp_cents_to_nano(egp_cents: int) -> int:
     """Convert EGP cents to USD nano for live wallet accounting.
 
-    Formula: EGP_cents / 100 / EGP_PER_USD * 1_000_000_000
-           = EGP_cents * 10_000_000 / EGP_PER_USD
+    Uses the live EGP/USD rate configured at registration time.
+    Formula: EGP_cents * 10_000_000 / EGP_PER_USD
     Uses Decimal exclusively. Returns integer USD nano.
     """
     return int(
-        (Decimal(int(egp_cents)) * Decimal("10000000") / EGP_PER_USD_REF)
+        (Decimal(int(egp_cents)) * Decimal("10000000") / _live_egp_per_usd)
         .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     )
 
@@ -210,6 +211,8 @@ def register_reward_api(
     cpagrip_rss_url: str = "https://www.cpagrip.com/common/offer_feed_rss.php",
 ):
     """Register Flask routes for the Mini App reward API."""
+    global _live_egp_per_usd
+    _live_egp_per_usd = Decimal(str(egp_per_usd))
 
     # Normalize SMMCPAN URL once at startup
     _raw = smmcpan_api_url.rstrip("/")
@@ -440,8 +443,9 @@ def register_reward_api(
             else:
                 sell_price_egp = cost_per_unit_egp
             # Convert to USD nano for the balance_usd_nano system
+            # Convert EGP → USD nano: EGP * 1,000,000,000 / EGP_PER_USD
             sell_price_nano = int(
-                (sell_price_egp * Decimal("100000000") / egp_per_usd_decimal).quantize(
+                (sell_price_egp * Decimal("1000000000") / egp_per_usd_decimal).quantize(
                     Decimal("1"), rounding=ROUND_HALF_UP
                 )
             )

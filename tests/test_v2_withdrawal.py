@@ -217,7 +217,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
             conn.execute(
                 "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
-                "VALUES (999, 'Test', 100000, 1, 1, 0)"
+                "VALUES (999, 'Test', 1000000000, 1, 1, 0)"
             )
             conn.commit()
         # Seed a stable rate
@@ -282,7 +282,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         self.assertEqual(result, "insufficient_balance")
         with gb.get_connection() as conn:
             conn.execute(
-                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 1000000000 WHERE user_id = 999"
             )
             conn.commit()
 
@@ -398,7 +398,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute(
-                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 1000000000 WHERE user_id = 999"
             )
             conn.commit()
         before = gb.get_user(999)["balance_usd_nano"]
@@ -410,13 +410,13 @@ class TestV2WithdrawalCreation(unittest.TestCase):
             usdt_amount=None,
         )
         after = gb.get_user(999)["balance_usd_nano"]
-        self.assertEqual(before - after, 1000)
+        self.assertEqual(before - after, gb.egp_cents_to_wallet_nano(1000))
 
     def test_49_failed_create_does_not_deduct(self):
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute(
-                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 1000000000 WHERE user_id = 999"
             )
             conn.commit()
         before = gb.get_user(999)["balance_usd_nano"]
@@ -435,7 +435,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute(
-                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 1000000000 WHERE user_id = 999"
             )
             conn.commit()
         rid = gb.create_v2_withdrawal_request(
@@ -454,7 +454,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute(
-                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 1000000000 WHERE user_id = 999"
             )
             conn.commit()
         gb._save_rate_snapshot(Decimal("50.00"), "test")
@@ -492,7 +492,7 @@ class TestV2AdminFlow(unittest.TestCase):
             conn.execute(
                 "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
-                "VALUES (888, 'T', 50000, 1, 1, 0)"
+                "VALUES (888, 'T', 5000000000, 1, 1, 0)"
             )
             conn.commit()
         gb._save_rate_snapshot(Decimal("50.00"), "test")
@@ -746,7 +746,7 @@ class TestVodafoneEnforcementAtRate(unittest.TestCase):
             conn.execute(
                 "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
-                "VALUES (555, 'T', 1000000, 1, 1, 0)"
+                "VALUES (555, 'T', 5000000000, 1, 1, 0)"
             )
             conn.commit()
 
@@ -987,7 +987,7 @@ class TestWithdrawalEntryGate(unittest.TestCase):
         with gb.get_connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO users (user_id, first_name, balance_usd_nano) "
-                "VALUES (8888, 'Test', 10000)"
+                "VALUES (8888, 'Test', 5000000000)"
             )
             conn.commit()
         gb._seed_rate = lambda: None  # mock
@@ -1017,10 +1017,10 @@ class TestWithdrawalEntryGate(unittest.TestCase):
         self.assertIsInstance(result, int)
         with gb.get_connection() as conn:
             user = conn.execute("SELECT balance_usd_nano FROM users WHERE user_id = 8888").fetchone()
-            self.assertLess(user["balance_usd_nano"], 10000)
+            self.assertLess(user["balance_usd_nano"], 5000000000)
             # Refund
             conn.execute("DELETE FROM withdrawal_requests WHERE user_id = 8888")
-            conn.execute("UPDATE users SET balance_usd_nano = 10000 WHERE user_id = 8888")
+            conn.execute("UPDATE users SET balance_usd_nano = 5000000000 WHERE user_id = 8888")
             conn.commit()
 
 
@@ -1306,12 +1306,12 @@ class TestV2VodafoneBoundaryAtRate50(unittest.TestCase):
             conn.execute(
                 "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
-                "VALUES (8001, 'Boundary', 500, 1, 1, 0)"
+                "VALUES (8001, 'Boundary', 100000000, 1, 1, 0)"
             )
             conn.execute(
                 "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
-                "VALUES (8002, 'Boundary', 499, 1, 1, 0)"
+                "VALUES (8002, 'Boundary', 99999999, 1, 1, 0)"
             )
             # Seed an exchange rate of 50 USDT/EGP, fresh.
             conn.execute(

@@ -39,7 +39,7 @@ gb = _mod
 
 # Import the reward_api module
 import reward_api as _reward_api_mod
-from reward_api import _egp_cents_to_nano, EGP_PER_USD_REF
+from reward_api import _egp_cents_to_nano, _live_egp_per_usd
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -69,6 +69,12 @@ class TestEgpCentsToNanoConversion(unittest.TestCase):
         """1 EGP cent = $0.0002 = 200,000 nano."""
         result = _egp_cents_to_nano(1)
         self.assertEqual(result, 200_000)
+
+    def test_04b_rate_is_configurable(self):
+        """_live_egp_per_usd must be configurable at runtime."""
+        import reward_api
+        self.assertIsInstance(reward_api._live_egp_per_usd, Decimal)
+        self.assertGreater(reward_api._live_egp_per_usd, 0)
 
     def test_05_uses_decimal_not_float(self):
         """Verify no float in conversion path."""
@@ -374,8 +380,9 @@ class TestExactNanoBoundary(unittest.TestCase):
         self.assertEqual(_egp_cents_to_nano(10000), 2_000_000_000)
 
     def test_04_conversion_uses_stored_rate(self):
-        """The helper uses EGP_PER_USD_REF = 50."""
-        self.assertEqual(EGP_PER_USD_REF, Decimal("50"))
+        """The helper uses _live_egp_per_usd (default = 50)."""
+        import reward_api
+        self.assertEqual(reward_api._live_egp_per_usd, Decimal("50"))
 
     def test_05_helper_returns_integer(self):
         """Result must always be int, never float or Decimal."""

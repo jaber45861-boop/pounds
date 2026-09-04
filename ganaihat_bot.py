@@ -445,7 +445,11 @@ TASK_CREATION_MIN_BALANCE_USD_NANO = 10_000_000
 
 
 def has_minimum_usd_nano_balance(balance_usd_nano: int) -> bool:
-    """Return True when balance meets the task-creation eligibility threshold."""
+    """Return True when balance meets the task-creation eligibility threshold.
+
+    This is an eligibility check ONLY.
+    It is NOT a fee, deposit, deduction, or reward minimum.
+    """
     return balance_usd_nano >= TASK_CREATION_MIN_BALANCE_USD_NANO
 
 
@@ -2614,9 +2618,11 @@ def grant_channel_reward(user_id: int, channel: dict) -> dict | None:
             conn.rollback()
             return None
 
+        # Convert channel reward from EGP cents to USD nano for live wallet
+        channel_reward_nano = egp_cents_to_wallet_nano(int(channel["reward"]))
         conn.execute(
             "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
-            (channel["reward"], user_id),
+            (channel_reward_nano, user_id),
         )
         conn.execute(
             "INSERT OR REPLACE INTO channel_reward_ledger "
@@ -4523,6 +4529,9 @@ def create_v2_withdrawal_request(
     # Store EGP cents using legacy amount_cents (for backward compatibility)
     amount_cents = egp_equiv_cents
 
+    # Convert EGP cents to USD nano for live wallet accounting
+    debit_nano = egp_cents_to_wallet_nano(amount_cents)
+
     # 4. Atomic transaction: cooldown + balance + insert
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -4547,11 +4556,11 @@ def create_v2_withdrawal_request(
             conn.rollback()
             return "cooldown"
 
-        # Atomic balance deduction
+        # Atomic balance deduction (debit_nano is USD nano, not EGP cents)
         cur = conn.execute(
             "UPDATE users SET balance_usd_nano = balance_usd_nano - ? "
             "WHERE user_id = ? AND balance_usd_nano >= ?",
-            (amount_cents, user_id, amount_cents),
+            (debit_nano, user_id, debit_nano),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -9934,6 +9943,15 @@ def callback_buy_service(call):
         bot.answer_callback_query(
             call.id,
             service_price_message(service_key, row_balance_cents(row)),
+            show_alert=True,
+        )
+        return
+
+    # Task creation eligibility gate: wallet >= $0.01 USD nano
+    if not has_minimum_usd_nano_balance(row_balance_cents(row)):
+        bot.answer_callback_query(
+            call.id,
+            "⚠️ رصيدك لا يفي بشروط إنشاء المهام.\nالحد الأدنى: $0.01",
             show_alert=True,
         )
         return
