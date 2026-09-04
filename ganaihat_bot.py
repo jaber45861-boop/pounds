@@ -510,10 +510,6 @@ def has_minimum_usd_nano_balance(balance_usd_nano: int) -> bool:
 # Migration version identifier
 MIGRATION_VERSION = "phase3_v1"
 
-# Fixed historical conversion rate (EGP per 1 USD).
-# This MUST be explicitly supplied at execution time — never auto-fetched.
-DEFAULT_MIGRATION_RATE = Decimal("50")
-
 
 def egp_cents_to_usd_nano(egp_cents: int, rate: Decimal) -> int:
     """Convert integer EGP cents to integer USD nano via a fixed rate.
@@ -639,10 +635,10 @@ def preview_legacy_migration(
     rate: Decimal,
     migration_id: str = "phase3_v1_egp_to_usd",
 ) -> dict:
-    """Offline migration preview — reads only, never writes.
+    """Offline migration preview — reads only, NEVER writes.
 
-    Takes a database path and produces a deterministic preview of the
-    EGP cents → USD nano migration WITHOUT modifying the source.
+    This function performs zero database writes. It opens the database
+    in read-only URI mode to guarantee no accidental mutations.
 
     Args:
         db_path: Path to the SQLite database to preview.
@@ -652,27 +648,30 @@ def preview_legacy_migration(
     Returns:
         A dict with full preview information including per-user details.
     """
-    import uuid as _uuid
-
     if isinstance(rate, float):
         raise TypeError(f"float rate rejected: {rate!r}. Use Decimal.")
     _r = _validate_egp_rate(rate)
 
-    conn = sqlite3.connect(db_path, timeout=30)
+    # Open in read-only URI mode — zero writes possible
+    import urllib.parse as _urllib
+    uri = "file:" + _urllib.quote(db_path, safe="") + "?mode=ro"
+    conn = sqlite3.connect(uri, timeout=30, uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        _create_migration_metadata_table(conn)
+        # Check if migration_meta table exists (read-only check)
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migration_meta'"
+        ).fetchone() is not None
 
-        # Check double-migration
-        existing_status = _get_migration_status(conn, migration_id)
-        if existing_status == "completed":
-            return {
-                "status": "already_completed",
-                "migration_id": migration_id,
-                "message": f"Migration {migration_id} was already completed.",
-            }
+        if table_exists:
+            existing_status = _get_migration_status(conn, migration_id)
+            if existing_status == "completed":
+                return {
+                    "status": "already_completed",
+                    "migration_id": migration_id,
+                    "message": f"Migration {migration_id} was already completed.",
+                }
 
-        # Check for already-migrated users
         all_users = conn.execute(
             "SELECT user_id, balance_cents, balance_usd_nano "
             "FROM users"
@@ -683,6 +682,7 @@ def preview_legacy_migration(
         positive_balance = 0
         negative_balance = 0
         already_migrated = 0
+        has_negative = False
         total_legacy_cents = Decimal("0")
         total_converted_nano = Decimal("0")
         details = []
@@ -708,16 +708,14 @@ def preview_legacy_migration(
 
             if balance_cents < 0:
                 negative_balance += 1
-                # Still convert for accounting visibility
-                nano = egp_cents_to_usd_nano(balance_cents, _r)
+                has_negative = True
+                # Do NOT convert — negative balances are invalid for migration
                 details.append({
                     "user_id": user["user_id"],
                     "old_balance_cents": balance_cents,
-                    "converted_balance_usd_nano": nano,
-                    "status": "negative_converted",
+                    "converted_balance_usd_nano": 0,
+                    "status": "negative_invalid",
                 })
-                total_legacy_cents += Decimal(balance_cents)
-                total_converted_nano += Decimal(nano)
                 continue
 
             positive_balance += 1
@@ -746,11 +744,13 @@ def preview_legacy_migration(
             "rows_positive_balance": positive_balance,
             "rows_negative_balance": negative_balance,
             "rows_already_migrated": already_migrated,
+            "has_negative_balances": has_negative,
             "total_legacy_egp_cents": int(total_legacy_cents),
             "total_converted_usd_nano": int(total_converted_nano),
             "details": details,
             "deterministic": True,
             "source_db_unmodified": True,
+            "wrote_to_source_db": False,
         }
     finally:
         conn.close()
@@ -769,6 +769,7 @@ def run_legacy_migration(
       - Idempotent: detects and rejects already-completed migrations.
       - Preserves balance_cents.
       - Only writes balance_usd_nano.
+      - REFUSES to proceed if any negative balances exist.
 
     Args:
         db_path: Path to the SQLite database to migrate.
@@ -797,16 +798,37 @@ def run_legacy_migration(
                 "migration_id": migration_id,
                 "message": f"Migration {migration_id} was already completed.",
             }
-        if existing_status == "previewed":
-            pass  # OK to proceed with execution
 
-        # Begin atomic transaction
-        conn.execute("BEGIN IMMEDIATE")
-
+        # Safety pre-check: scan for negative balances before writing anything
         all_users = conn.execute(
             "SELECT user_id, balance_cents, balance_usd_nano "
             "FROM users"
         ).fetchall()
+
+        negative_users = []
+        for user in all_users:
+            balance_cents = int(user["balance_cents"] or 0)
+            balance_usd_nano = int(user["balance_usd_nano"] or 0)
+            if balance_usd_nano != 0:
+                continue
+            if balance_cents < 0:
+                negative_users.append(user["user_id"])
+
+        if negative_users:
+            return {
+                "status": "rejected_negative_balances",
+                "migration_id": migration_id,
+                "message": (
+                    f"Migration refused: {len(negative_users)} user(s) have negative "
+                    f"balance_cents. Negative balances are invalid for automatic "
+                    f"EGP-to-USD migration. Requires operator review."
+                ),
+                "affected_user_ids": negative_users,
+                "rows_affected": len(negative_users),
+            }
+
+        # Begin atomic transaction
+        conn.execute("BEGIN IMMEDIATE")
 
         rows_migrated = 0
         rows_skipped = 0

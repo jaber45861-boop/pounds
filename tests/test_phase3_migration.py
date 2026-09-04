@@ -166,9 +166,10 @@ class TestSchemaPhase3(unittest.TestCase):
         self.assertIsInstance(MIGRATION_VERSION, str)
         self.assertTrue(len(MIGRATION_VERSION) > 0)
 
-    def test_09_default_rate(self):
-        self.assertIsInstance(gb.DEFAULT_MIGRATION_RATE, Decimal)
-        self.assertGreater(gb.DEFAULT_MIGRATION_RATE, 0)
+    def test_09_no_default_migration_rate(self):
+        """DEFAULT_MIGRATION_RATE must not exist — rate must always be explicit."""
+        self.assertFalse(hasattr(gb, "DEFAULT_MIGRATION_RATE"),
+                         "DEFAULT_MIGRATION_RATE must be removed")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -711,5 +712,322 @@ class TestEdgeCases(unittest.TestCase):
             os.unlink(path)
 
 
-if __name__ == "__main__":
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ISSUE 1: Preview Read-Only Regression Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPreviewReadOnly(unittest.TestCase):
+    """Regression: preview_legacy_migration must perform zero writes."""
+
+    def test_a1_preview_does_not_create_migration_meta(self):
+        """Preview must not create the migration_meta table on a fresh DB."""
+        fd, path = tempfile.mkstemp(suffix='.db')
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("""CREATE TABLE users (
+                user_id INTEGER PRIMARY KEY, first_name TEXT NOT NULL,
+                balance_cents INTEGER NOT NULL DEFAULT 0,
+                balance_usd_nano INTEGER NOT NULL DEFAULT 0,
+                activation_status INTEGER NOT NULL DEFAULT 0
+            )""")
+            conn.execute("INSERT INTO users (user_id, first_name, balance_cents) VALUES (1, 'Test', 5000)")
+            conn.commit()
+            conn.close()
+
+            preview_legacy_migration(path, Decimal('50'))
+
+            conn = sqlite3.connect(path)
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            conn.close()
+            self.assertNotIn('migration_meta', tables,
+                            'Preview must not create migration_meta table')
+        finally:
+            os.unlink(path)
+
+    def test_a2_preview_does_not_alter_schema(self):
+        """Preview must not add columns to existing tables."""
+        fd, path = tempfile.mkstemp(suffix='.db')
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("""CREATE TABLE users (
+                user_id INTEGER PRIMARY KEY, first_name TEXT NOT NULL,
+                balance_cents INTEGER NOT NULL DEFAULT 0,
+                balance_usd_nano INTEGER NOT NULL DEFAULT 0,
+                activation_status INTEGER NOT NULL DEFAULT 0
+            )""")
+            conn.execute("INSERT INTO users (user_id, first_name, balance_cents) VALUES (1, 'Test', 5000)")
+            conn.commit()
+            before_cols = {r[1] for r in conn.execute('PRAGMA table_info(users)').fetchall()}
+            conn.close()
+
+            preview_legacy_migration(path, Decimal('50'))
+
+            conn = sqlite3.connect(path)
+            after_cols = {r[1] for r in conn.execute('PRAGMA table_info(users)').fetchall()}
+            conn.close()
+            self.assertEqual(before_cols, after_cols, 'Preview must not alter schema')
+        finally:
+            os.unlink(path)
+
+    def test_a3_preview_does_not_alter_user_balances(self):
+        """Preview must not modify balance_cents or balance_usd_nano."""
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(9001, 5000), (9002, 100)])
+        try:
+            conn = sqlite3.connect(path); conn.row_factory = sqlite3.Row
+            before = {}
+            for uid in [9001, 9002]:
+                r = conn.execute('SELECT balance_cents, balance_usd_nano FROM users WHERE user_id=?', (uid,)).fetchone()
+                before[uid] = (r['balance_cents'], r['balance_usd_nano'])
+            conn.close()
+
+            preview_legacy_migration(path, Decimal('50'))
+
+            conn = sqlite3.connect(path); conn.row_factory = sqlite3.Row
+            for uid in [9001, 9002]:
+                r = conn.execute('SELECT balance_cents, balance_usd_nano FROM users WHERE user_id=?', (uid,)).fetchone()
+                self.assertEqual((r['balance_cents'], r['balance_usd_nano']), before[uid])
+            conn.close()
+        finally:
+            os.unlink(path)
+
+    def test_a4_preview_does_not_alter_migration_columns(self):
+        """Preview must not write to migration snapshot columns."""
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(9003, 5000)])
+        try:
+            conn = sqlite3.connect(path); conn.row_factory = sqlite3.Row
+            r = conn.execute('SELECT balance_usd_nano_rate, balance_usd_nano_migrated_at FROM users WHERE user_id=9003').fetchone()
+            before_rate = r['balance_usd_nano_rate']
+            before_ts = r['balance_usd_nano_migrated_at']
+            conn.close()
+
+            preview_legacy_migration(path, Decimal('50'))
+
+            conn = sqlite3.connect(path); conn.row_factory = sqlite3.Row
+            r = conn.execute('SELECT balance_usd_nano_rate, balance_usd_nano_migrated_at FROM users WHERE user_id=9003').fetchone()
+            self.assertEqual(r['balance_usd_nano_rate'], before_rate)
+            self.assertEqual(r['balance_usd_nano_migrated_at'], before_ts)
+            conn.close()
+        finally:
+            os.unlink(path)
+
+    def test_a5_preview_wrote_to_source_db_flag(self):
+        """Preview result must explicitly report no writes."""
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(9004, 5000)])
+        try:
+            result = preview_legacy_migration(path, Decimal('50'))
+            self.assertFalse(result.get('wrote_to_source_db'))
+        finally:
+            os.unlink(path)
+
+    def test_a6_preview_readonly_uri_open(self):
+        """Preview must open DB in read-only mode and not create migration_meta."""
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(9005, 5000)])
+        try:
+            # Count tables before
+            conn = sqlite3.connect(path)
+            before = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            conn.close()
+
+            result = preview_legacy_migration(path, Decimal('50'))
+            self.assertFalse(result.get('wrote_to_source_db'))
+
+            # Count tables after — must be identical
+            conn = sqlite3.connect(path)
+            after = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            conn.close()
+            self.assertEqual(before, after)
+        finally:
+            os.unlink(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ISSUE 2: Negative Balance Policy Regression Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNegativeBalancePolicy(unittest.TestCase):
+    """Regression: negative balances must be detected, not converted, not crash."""
+
+    def test_b1_preview_detects_negative(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8001, 5000), (8002, -100), (8003, 0)])
+        try:
+            result = preview_legacy_migration(path, Decimal('50'))
+            self.assertEqual(result['rows_negative_balance'], 1)
+            self.assertTrue(result['has_negative_balances'])
+        finally:
+            os.unlink(path)
+
+    def test_b2_preview_does_not_crash_on_negative(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8004, -500)])
+        try:
+            result = preview_legacy_migration(path, Decimal('50'))
+            self.assertEqual(result['rows_negative_balance'], 1)
+            self.assertEqual(result['rows_positive_balance'], 0)
+            self.assertEqual(result['total_converted_usd_nano'], 0)
+        finally:
+            os.unlink(path)
+
+    def test_b3_preview_does_not_convert_negative(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8005, -100), (8006, 5000)])
+        try:
+            result = preview_legacy_migration(path, Decimal('50'))
+            # Only user 8006 should contribute to totals
+            self.assertEqual(result['total_legacy_egp_cents'], 5000)
+            self.assertEqual(result['total_converted_usd_nano'], 1_000_000_000)
+            # Negative user detail must show negative_invalid status
+            neg_details = [d for d in result['details'] if d['old_balance_cents'] < 0]
+            self.assertEqual(len(neg_details), 1)
+            self.assertEqual(neg_details[0]['status'], 'negative_invalid')
+            self.assertEqual(neg_details[0]['converted_balance_usd_nano'], 0)
+        finally:
+            os.unlink(path)
+
+    def test_b4_preview_negative_not_in_totals(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8007, -1000), (8008, -500)])
+        try:
+            result = preview_legacy_migration(path, Decimal('50'))
+            self.assertEqual(result['total_legacy_egp_cents'], 0)
+            self.assertEqual(result['total_converted_usd_nano'], 0)
+            self.assertEqual(result['rows_negative_balance'], 2)
+        finally:
+            os.unlink(path)
+
+    def test_b5_execution_rejects_negative_balances(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8009, 5000), (8010, -100)])
+        try:
+            result = run_legacy_migration(path, Decimal('50'))
+            self.assertEqual(result['status'], 'rejected_negative_balances')
+            self.assertIn(8010, result['affected_user_ids'])
+        finally:
+            os.unlink(path)
+
+    def test_b6_execution_zero_writes_on_negative(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8011, -100)])
+        try:
+            conn = sqlite3.connect(path); conn.row_factory = sqlite3.Row
+            before = conn.execute('SELECT balance_cents, balance_usd_nano FROM users WHERE user_id=8011').fetchone()
+            before_cents, before_nano = before['balance_cents'], before['balance_usd_nano']
+            conn.close()
+
+            run_legacy_migration(path, Decimal('50'))
+
+            conn = sqlite3.connect(path); conn.row_factory = sqlite3.Row
+            after = conn.execute('SELECT balance_cents, balance_usd_nano FROM users WHERE user_id=8011').fetchone()
+            self.assertEqual(after['balance_cents'], before_cents)
+            self.assertEqual(after['balance_usd_nano'], before_nano)
+            conn.close()
+        finally:
+            os.unlink(path)
+
+    def test_b7_execution_negative_only_users_still_rejected(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8012, -1)])
+        try:
+            result = run_legacy_migration(path, Decimal('50'))
+            self.assertEqual(result['status'], 'rejected_negative_balances')
+        finally:
+            os.unlink(path)
+
+    def test_b8_positive_still_works_without_negative(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8013, 5000), (8014, 0)])
+        try:
+            result = run_legacy_migration(path, Decimal('50'))
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['rows_migrated'], 1)
+        finally:
+            os.unlink(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ISSUE 3: Explicit Rate Regression Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExplicitRateRequirement(unittest.TestCase):
+    """Regression: migration functions must require explicit rate."""
+
+    def test_c1_no_default_rate_constant(self):
+        self.assertFalse(hasattr(gb, 'DEFAULT_MIGRATION_RATE'))
+
+    def test_c2_preview_requires_explicit_rate(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8101, 5000)])
+        try:
+            result = preview_legacy_migration(path, Decimal('50'))
+            self.assertEqual(result['egp_per_usd'], '50')
+        finally:
+            os.unlink(path)
+
+    def test_c3_execution_requires_explicit_rate(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8102, 5000)])
+        try:
+            result = run_legacy_migration(path, Decimal('50'))
+            self.assertEqual(result['rate'], '50')
+        finally:
+            os.unlink(path)
+
+    def test_c4_invalid_rate_still_rejected(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8103, 5000)])
+        try:
+            with self.assertRaises((ValueError, TypeError)):
+                run_legacy_migration(path, Decimal('0'))
+        finally:
+            os.unlink(path)
+
+    def test_c5_missing_rate_type_rejected(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8104, 5000)])
+        try:
+            with self.assertRaises(TypeError):
+                run_legacy_migration(path, 50.0)
+        finally:
+            os.unlink(path)
+
+    def test_c6_preview_rate_float_rejected(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8105, 5000)])
+        try:
+            with self.assertRaises(TypeError):
+                preview_legacy_migration(path, 50.0)
+        finally:
+            os.unlink(path)
+
+    def test_c7_non_default_rate_works(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        _create_test_db(path, users=[(8106, 5000)])
+        try:
+            result = run_legacy_migration(path, Decimal('48.75'))
+            self.assertEqual(result['rate'], '48.75')
+            conn = sqlite3.connect(path); conn.row_factory = sqlite3.Row
+            r = conn.execute('SELECT balance_usd_nano FROM users WHERE user_id=8106').fetchone()
+            # 5000 cents = 50 EGP / 48.75 rate
+            expected = gb.egp_cents_to_usd_nano(5000, Decimal('48.75'))
+            self.assertEqual(r['balance_usd_nano'], expected)
+            conn.close()
+        finally:
+            os.unlink(path)
+
+    def test_c8_no_env_var_fallback(self):
+        """No env var should silently become the historical migration rate."""
+        self.assertFalse(hasattr(gb, 'DEFAULT_MIGRATION_RATE'))
+        self.assertFalse(hasattr(gb, 'MIGRATION_DEFAULT_RATE'))
+        self.assertFalse(hasattr(gb, 'HISTORICAL_RATE'))
+
+
+if __name__ == '__main__':
     unittest.main()
