@@ -147,7 +147,7 @@ def _process_conversion(
             (idempotency_key, conv.user_id, user_cents),
         )
         cursor.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
             (user_cents, conv.user_id),
         )
 
@@ -224,7 +224,7 @@ def register_reward_api(
 
     @app.route("/api/rewards/balance")
     def api_balance():
-        """Return the authenticated user's balance in cents."""
+        """Return the authenticated user's balance in USD nano."""
         uid = _authenticate_user()
         if uid is None:
             return jsonify({"error": "unauthorized"}), 401
@@ -232,13 +232,15 @@ def register_reward_api(
         if user is None:
             return jsonify({"error": "user_not_found"}), 404
         try:
-            balance = max(0, int(user["balance_cents"]))
+            balance_nano = max(0, int(user["balance_usd_nano"] or 0))
         except (KeyError, TypeError):
-            balance = max(0, int(user["points"] or 0))
+            balance_nano = 0
+        from decimal import Decimal as _D
+        balance_usd = float(_D(balance_nano) / _D("1000000000"))
         return jsonify({
             "user_id": uid,
-            "balance_cents": balance,
-            "balance_egp": round(balance / 100, 2),
+            "balance_usd_nano": balance_nano,
+            "balance_usd": round(balance_usd, 9),
         })
 
     @app.route("/api/rewards/postback", methods=["POST"])
@@ -290,7 +292,7 @@ def register_reward_api(
                 (uid, ymid, reward),
             )
             conn.execute(
-                "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
+                "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
                 (reward, uid),
             )
             conn.commit()
@@ -415,9 +417,9 @@ def register_reward_api(
                 sell_price_egp = cost_per_unit_egp / (Decimal("1") - margin_decimal)
             else:
                 sell_price_egp = cost_per_unit_egp
-            # Convert to cents for the balance_cents system
-            sell_price_cents = int(
-                (sell_price_egp * Decimal("100")).quantize(
+            # Convert to USD nano for the balance_usd_nano system
+            sell_price_nano = int(
+                (sell_price_egp * Decimal("100000000") / egp_per_usd_decimal).quantize(
                     Decimal("1"), rounding=ROUND_HALF_UP
                 )
             )

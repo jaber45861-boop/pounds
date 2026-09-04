@@ -67,8 +67,8 @@ class TestActiveReferralQualification(unittest.TestCase):
     # ── Test 1: REFERRAL_REWARD constant ───────────────────────────────
 
     def test_01_referral_reward_is_one_cent(self):
-        """REFERRAL_REWARD must be exactly 1 cent ($0.01)."""
-        self.assertEqual(gb.REFERRAL_REWARD, 1)
+        """REFERRAL_REWARD_USD_NANO must be exactly $0.01 = 10,000,000 nano."""
+        self.assertEqual(gb.REFERRAL_REWARD_USD_NANO, 10_000_000)
 
     # ── Test 2: Registration alone → $0 reward ────────────────────────
 
@@ -86,11 +86,11 @@ class TestActiveReferralQualification(unittest.TestCase):
         ref = self._get_referral(1001, 2001)
         self.assertIsNotNone(ref, "Referral record should exist")
         self.assertEqual(ref["reward_status"], "pending")
-        self.assertEqual(ref["reward_points"], gb.REFERRAL_REWARD)
+        self.assertEqual(ref["reward_points"], gb.REFERRAL_REWARD_USD_NANO)
 
         # Referrer balance must NOT have changed
         referrer = gb.get_user(1001)
-        self.assertEqual(referrer["balance_cents"], 0)
+        self.assertEqual(referrer["balance_usd_nano"], 0)
 
     # ── Test 3: Activation → $0.01 reward once ────────────────────────
 
@@ -112,7 +112,7 @@ class TestActiveReferralQualification(unittest.TestCase):
 
         # Referrer must have received exactly REFERRAL_REWARD (1 cent)
         referrer = gb.get_user(1001)
-        self.assertEqual(referrer["balance_cents"], gb.REFERRAL_REWARD)
+        self.assertEqual(referrer["balance_usd_nano"], gb.REFERRAL_REWARD_USD_NANO)
 
         # Referral status must be 'rewarded'
         ref = self._get_referral(1001, 2001)
@@ -140,7 +140,7 @@ class TestActiveReferralQualification(unittest.TestCase):
 
         # Balance must be exactly REFERRAL_REWARD, not double
         referrer = gb.get_user(1001)
-        self.assertEqual(referrer["balance_cents"], gb.REFERRAL_REWARD)
+        self.assertEqual(referrer["balance_usd_nano"], gb.REFERRAL_REWARD_USD_NANO)
 
     # ── Test 5: Multiple activities → still $0.01 ─────────────────────
 
@@ -181,7 +181,7 @@ class TestActiveReferralQualification(unittest.TestCase):
         self.assertEqual(released, 0, "No reward for inactive referral")
 
         referrer = gb.get_user(1001)
-        self.assertEqual(referrer["balance_cents"], 0)
+        self.assertEqual(referrer["balance_usd_nano"], 0)
 
     # ── Test 7: 10 qualified referrals → $0.10 ────────────────────────
 
@@ -197,8 +197,8 @@ class TestActiveReferralQualification(unittest.TestCase):
         self.assertEqual(released, 10, "Should release all 10 referrals")
 
         referrer = gb.get_user(1001)
-        expected = 10 * gb.REFERRAL_REWARD  # 10 cents
-        self.assertEqual(referrer["balance_cents"], expected)
+        expected = 10 * gb.REFERRAL_REWARD_USD_NANO  # 10 cents
+        self.assertEqual(referrer["balance_usd_nano"], expected)
 
     # ── Test 8: Existing behavior preserved ────────────────────────────
 
@@ -238,7 +238,7 @@ class TestActiveReferralQualification(unittest.TestCase):
         self.assertEqual(released, 2, "Only 2 activated referrals rewarded")
 
         referrer = gb.get_user(1001)
-        self.assertEqual(referrer["balance_cents"], 2 * gb.REFERRAL_REWARD)
+        self.assertEqual(referrer["balance_usd_nano"], 2 * gb.REFERRAL_REWARD_USD_NANO)
 
     # ── Test 10: State transition pending → rewarded ───────────────────
 

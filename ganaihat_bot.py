@@ -125,7 +125,7 @@ CPAGRIP_RSS_URL         = "https://www.cpagrip.com/common/offer_feed_rss.php"
 REFERRAL_SERVICE_KEY = "referral_boost"
 REFERRAL_COST = 500
 REFERRAL_QUANTITY = 25
-REFERRAL_REWARD = 1   # 0.01 جنيه ($0.01) – مكافأة إحالة م팎رة عند تفعيل الحساب
+REFERRAL_REWARD = 1   # Legacy EGP cents (preserved for migration)
 WITHDRAWAL_MIN_POINTS = 5000
 DEFAULT_ORDER_MIN_POINTS = 100
 ABSOLUTE_ORDER_MIN_POINTS = 1
@@ -445,11 +445,79 @@ TASK_CREATION_MIN_BALANCE_USD_NANO = 10_000_000
 
 
 def has_minimum_usd_nano_balance(balance_usd_nano: int) -> bool:
-    """Return True when balance meets the task-creation eligibility threshold.
-
-    This is a pure domain primitive — NOT wired into live task creation yet.
-    """
+    """Return True when balance meets the task-creation eligibility threshold."""
     return balance_usd_nano >= TASK_CREATION_MIN_BALANCE_USD_NANO
+
+
+# --- USD Nano Wallet Constants (Live Accounting) ---
+REFERRAL_REWARD_USD_NANO     = 10_000_000   # $0.01 exactly
+ACTIVATION_REWARD_USD_NANO   = 10_000_000   # $0.01 exactly
+AD_REWARD_USD_NANO           = 10_000_000   # $0.01 exactly
+PROMOTED_CHANNEL_REWARD_USD_NANO = 10_000_000  # $0.01 exactly
+
+
+def egp_cents_to_wallet_nano(egp_cents: int) -> int:
+    """Convert EGP cents to USD nano for live wallet accounting.
+
+    Formula: EGP_cents / 100 / EGP_PER_USD * 1_000_000_000
+           = EGP_cents * 10_000_000 / EGP_PER_USD
+    Uses Decimal exclusively. Returns integer USD nano.
+    """
+    return int(
+        (Decimal(int(egp_cents)) * Decimal("10000000") / EGP_PER_USD)
+        .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
+
+def credit_usd_nano(user_id: int, nano: int) -> None:
+    """Atomically credit USD nano to a user wallet."""
+    if not isinstance(nano, int) or isinstance(nano, bool) or nano <= 0:
+        raise ValueError(f"credit_usd_nano requires positive int, got {nano!r}")
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (nano, user_id),
+        )
+        conn.commit()
+
+
+def debit_usd_nano(user_id: int, nano: int) -> bool:
+    """Atomically debit USD nano from a user wallet (sufficient-balance gate).
+
+    Returns True if debit succeeded, False if insufficient balance.
+    """
+    if not isinstance(nano, int) or isinstance(nano, bool) or nano <= 0:
+        raise ValueError(f"debit_usd_nano requires positive int, got {nano!r}")
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE users SET balance_usd_nano = balance_usd_nano - ? "
+            "WHERE user_id = ? AND balance_usd_nano >= ?",
+            (nano, user_id, nano),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def get_balance_usd_nano(user_id: int) -> int:
+    """Read the current USD nano balance for a user."""
+    row = get_user(user_id)
+    if row is None:
+        return 0
+    try:
+        return max(0, int(row["balance_usd_nano"] or 0))
+    except (KeyError, IndexError, TypeError):
+        return 0
+
+
+def balance_text_usd(row) -> str:
+    """Format a user balance for display using USD nano."""
+    if row is None:
+        return format_usd_nano(0)
+    try:
+        nano = max(0, int(row["balance_usd_nano"] or 0))
+    except (KeyError, IndexError, TypeError):
+        nano = 0
+    return format_usd_nano(nano)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1021,8 +1089,14 @@ def format_usd(cents: int | None) -> str:
     return f"${amount:.2f}"
 
 
-def format_balance(cents: int | None) -> str:
-    return f"{format_egp(cents)} ({format_usd(cents)})"
+def format_balance(nano_or_cents: int | None) -> str:
+    """Format wallet amount for display.
+
+    Accepts USD nano (live accounting) or legacy EGP cents.
+    When called with USD nano values (post-cutover), displays as USD.
+    """
+    val = int(nano_or_cents or 0)
+    return format_usd_nano(val)
 
 
 def format_money_input(cents: int | None) -> str:
@@ -1034,13 +1108,13 @@ def row_balance_cents(row) -> int:
     if row is None:
         return 0
     try:
-        return max(0, int(row["balance_cents"]))
+        return max(0, int(row["balance_usd_nano"]))
     except (KeyError, IndexError, TypeError):
         return max(0, int(row["points"] or 0))
 
 
 def balance_text(row) -> str:
-    return format_balance(row_balance_cents(row))
+    return balance_text_usd(row)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1492,7 +1566,7 @@ def set_promotion_package_active(package_key: str, active: bool) -> bool:
 
 def promotion_package_price(package: dict) -> str:
     """يعرض سعر الباقة بالعملة المصرية والدولار من قيمة القروش المحفوظة."""
-    return format_balance(int(package["points_cost"]))
+    return format_balance(egp_cents_to_wallet_nano(int(package["points_cost"])))
 
 
 def next_promotion_package_key(label: str, target_subscribers: int, points_cost: int) -> str:
@@ -1662,7 +1736,7 @@ def init_db():
         conn.execute(
             "UPDATE referrals SET reward_points = ? "
             "WHERE reward_status = 'pending'",
-            (REFERRAL_REWARD,),
+            (REFERRAL_REWARD_USD_NANO,),
         )
         # إزالة الحظر القديم الذي سببه فحص احتجاز الإحالات فقط.
         conn.execute(
@@ -2260,9 +2334,9 @@ def create_promoted_channel_campaign(
             return None
 
         deducted = conn.execute(
-            "UPDATE users SET balance_cents = balance_cents - ? "
-            "WHERE user_id = ? AND balance_cents >= ?",
-            (package["points_cost"], advertiser_id, package["points_cost"]),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano - ? "
+            "WHERE user_id = ? AND balance_usd_nano >= ?",
+            (egp_cents_to_wallet_nano(package["points_cost"]), advertiser_id, egp_cents_to_wallet_nano(package["points_cost"])),
         ).rowcount
         if deducted != 1:
             conn.rollback()
@@ -2399,13 +2473,9 @@ def add_user(user_id: int, first_name: str,
 
 
 def add_points(user_id: int, amount: int):
-    """يضيف مبلغاً بالقروش إلى الرصيد المالي."""
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (amount, user_id),
-        )
-        conn.commit()
+    """Add EGP cents to wallet via USD nano."""
+    credit_usd_nano(user_id, egp_cents_to_wallet_nano(amount))
+
 
 
 def is_account_active(user_id: int) -> bool:
@@ -2445,12 +2515,12 @@ def enforce_channel_subscriptions(user_id: int, channels: list[dict] | None = No
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         user = conn.execute(
-            "SELECT balance_cents FROM users WHERE user_id = ?", (user_id,)
+            "SELECT balance_usd_nano FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
         if user is None:
             conn.rollback()
             return penalized
-        current_points = int(user["balance_cents"] or 0)
+        current_points = int(user["balance_usd_nano"] or 0)
         missing_channel = False
         for ch in channels:
             if ch["subscribed"]:
@@ -2466,12 +2536,12 @@ def enforce_channel_subscriptions(user_id: int, channels: list[dict] | None = No
                 continue
 
             deducted_points = (
-                min(current_points, int(ch["reward"]))
+                min(current_points, egp_cents_to_wallet_nano(int(ch["reward"])))
                 if ch["rewarded"] else 0
             )
             if deducted_points:
                 conn.execute(
-                    "UPDATE users SET balance_cents = balance_cents - ? WHERE user_id = ?",
+                    "UPDATE users SET balance_usd_nano = balance_usd_nano - ? WHERE user_id = ?",
                     (deducted_points, user_id),
                 )
                 current_points -= deducted_points
@@ -2523,7 +2593,7 @@ def grant_channel_reward(user_id: int, channel: dict) -> dict | None:
             restored = int(ledger["deducted_points"] or 0)
             if restored:
                 conn.execute(
-                    "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
+                    "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
                     (restored, user_id),
                 )
             conn.execute(
@@ -2545,7 +2615,7 @@ def grant_channel_reward(user_id: int, channel: dict) -> dict | None:
             return None
 
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
             (channel["reward"], user_id),
         )
         conn.execute(
@@ -2586,7 +2656,7 @@ def restore_channel_rewards(
             amount = int(ledger["deducted_points"] or 0)
             if amount:
                 conn.execute(
-                    "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
+                    "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
                     (amount, user_id),
                 )
             conn.execute(
@@ -2661,9 +2731,9 @@ def activate_user(user_id: int) -> bool:
 
     with get_connection() as conn:
         updated = conn.execute(
-            "UPDATE users SET activation_status = 1, balance_cents = balance_cents + ? "
+            "UPDATE users SET activation_status = 1, balance_usd_nano = balance_usd_nano + ? "
             "WHERE user_id = ? AND activation_status = 0",
-            (ACTIVATION_REWARD, user_id),
+            (ACTIVATION_REWARD_USD_NANO, user_id),
         ).rowcount
         if updated != 1:
             return False
@@ -2696,15 +2766,9 @@ def reactivate_after_penalty(user_id: int) -> bool:
 
 
 def deduct_points(user_id: int, amount: int) -> bool:
-    """يخصم مبلغاً بالقروش ذرياً."""
-    with get_connection() as conn:
-        cur = conn.execute(
-            "UPDATE users SET balance_cents = balance_cents - ? "
-            "WHERE user_id = ? AND balance_cents >= ?",
-            (amount, user_id, amount),
-        )
-        conn.commit()
-        return cur.rowcount == 1
+    """Deduct EGP cents from wallet via USD nano."""
+    return debit_usd_nano(user_id, egp_cents_to_wallet_nano(amount))
+
 
 
 def calculate_selling_price(base_cost: int) -> int:
@@ -2925,7 +2989,7 @@ def service_price_message(service_key: str, balance: int) -> str:
     """رسالة موحدة عند عدم كفاية الرصيد لسعر الخدمة الحالي."""
     price = get_service_price(service_key)
     return (
-        f"❌ سعر هذه الخدمة هو <b>{format_balance(price)}</b>.\n"
+        f"❌ سعر هذه الخدمة هو <b>{format_balance(egp_cents_to_wallet_nano(price))}</b>.\n"
         f"رصيدك الحالي: <b>{format_balance(balance)}</b>."
     )
 
@@ -2945,7 +3009,7 @@ def record_referral(referrer_id: int, referred_id: int) -> bool:
             (
                 referrer_id,
                 referred_id,
-                REFERRAL_REWARD,
+                REFERRAL_REWARD_USD_NANO,
                 referrer_id,
                 referred_id,
             ),
@@ -2972,8 +3036,8 @@ def release_referral_reward(conn, referred_id: int) -> int:
         if changed != 1:
             continue
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (REFERRAL_REWARD, referral["referrer_id"]),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (REFERRAL_REWARD_USD_NANO, referral["referrer_id"]),
         )
         released += 1
     return released
@@ -3104,9 +3168,9 @@ def create_referral_task(
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
-            "UPDATE users SET balance_cents = balance_cents - ? "
-            "WHERE user_id = ? AND balance_cents >= ?",
-            (points_spent, buyer_id, points_spent),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano - ? "
+            "WHERE user_id = ? AND balance_usd_nano >= ?",
+            (egp_cents_to_wallet_nano(points_spent), buyer_id, egp_cents_to_wallet_nano(points_spent)),
         )
         if cur.rowcount != 1:
             return None
@@ -3261,8 +3325,8 @@ def approve_referral_task_claim(claim_id: int, buyer_id: int):
             conn.rollback()
             return None
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (REFERRAL_REWARD, claim["worker_id"]),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (REFERRAL_REWARD_USD_NANO, claim["worker_id"]),
         )
         conn.execute(
             "UPDATE referral_task_claims SET status = 'approved', "
@@ -3273,7 +3337,7 @@ def approve_referral_task_claim(claim_id: int, buyer_id: int):
         )
         conn.commit()
         result = dict(claim)
-        result["reward_points"] = REFERRAL_REWARD
+        result["reward_points"] = REFERRAL_REWARD_USD_NANO
         return result
 
 
@@ -3413,12 +3477,12 @@ def approve_referral_task_complaint(complaint_id: int):
         # هذه الشكوى تعويض مستقل بعد رفض العميل، لذلك لا تُنقص حصة المهمة.
         # يُخصم المبلغ من المعلن مباشرةً وتُسجل العملية لصالح المؤدي.
         charged = conn.execute(
-            "UPDATE users SET balance_cents = balance_cents - ? "
-            "WHERE user_id = ? AND balance_cents >= ?",
+            "UPDATE users SET balance_usd_nano = balance_usd_nano - ? "
+            "WHERE user_id = ? AND balance_usd_nano >= ?",
             (
-                REFERRAL_REWARD,
+                REFERRAL_REWARD_USD_NANO,
                 complaint["buyer_id"],
-                REFERRAL_REWARD,
+                REFERRAL_REWARD_USD_NANO,
             ),
         ).rowcount
         if charged != 1:
@@ -3427,8 +3491,8 @@ def approve_referral_task_complaint(complaint_id: int):
             result["error"] = "insufficient_buyer_balance"
             return result
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (REFERRAL_REWARD, complaint["worker_id"]),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (REFERRAL_REWARD_USD_NANO, complaint["worker_id"]),
         )
         conn.execute(
             "UPDATE referral_task_complaints SET status = 'approved', "
@@ -3442,7 +3506,7 @@ def approve_referral_task_complaint(complaint_id: int):
         )
         conn.commit()
         result = dict(complaint)
-        result["reward_points"] = REFERRAL_REWARD
+        result["reward_points"] = REFERRAL_REWARD_USD_NANO
         return result
 
 
@@ -3685,8 +3749,8 @@ def approve_manual_task_review(review_id: int):
             return None
 
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (review["reward_points"], review["user_id"]),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (egp_cents_to_wallet_nano(review["reward_points"]), review["user_id"]),
         )
         conn.execute(
             "UPDATE manual_task_reviews SET status = 'approved', "
@@ -3808,8 +3872,8 @@ def approve_ad_review(review_id: int):
             return None
 
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (review["reward_cents"], review["user_id"]),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (egp_cents_to_wallet_nano(review["reward_cents"]), review["user_id"]),
         )
         result = {
             "user_id": review["user_id"],
@@ -3977,8 +4041,8 @@ def claim_manual_task(task_id: int, worker_id: int) -> str:
             return "unavailable"
 
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (task["reward_points"], worker_id),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (egp_cents_to_wallet_nano(task["reward_points"]), worker_id),
         )
         return "claimed"
 
@@ -4021,8 +4085,8 @@ def create_withdrawal_request(
             return "cooldown"
 
         cur = conn.execute(
-            "UPDATE users SET balance_cents = balance_cents - ? "
-            "WHERE user_id = ? AND balance_cents >= ?",
+            "UPDATE users SET balance_usd_nano = balance_usd_nano - ? "
+            "WHERE user_id = ? AND balance_usd_nano >= ?",
             (points_amount, user_id, points_amount),
         )
         if cur.rowcount != 1:
@@ -4107,8 +4171,8 @@ def cancel_withdrawal_and_refund(request_id: int):
             (request_id,),
         )
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (row["amount_cents"] or row["points_amount"], row["user_id"]),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (egp_cents_to_wallet_nano(row["amount_cents"] or row["points_amount"]), row["user_id"]),
         )
         return True
 
@@ -4465,7 +4529,7 @@ def create_v2_withdrawal_request(
 
         # Block if user is fraud-blocked
         user_row = conn.execute(
-            "SELECT balance_cents, withdrawal_blocked FROM users WHERE user_id = ?",
+            "SELECT balance_usd_nano, withdrawal_blocked FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if user_row is None or user_row["withdrawal_blocked"]:
@@ -4485,8 +4549,8 @@ def create_v2_withdrawal_request(
 
         # Atomic balance deduction
         cur = conn.execute(
-            "UPDATE users SET balance_cents = balance_cents - ? "
-            "WHERE user_id = ? AND balance_cents >= ?",
+            "UPDATE users SET balance_usd_nano = balance_usd_nano - ? "
+            "WHERE user_id = ? AND balance_usd_nano >= ?",
             (amount_cents, user_id, amount_cents),
         )
         if cur.rowcount != 1:
@@ -4597,8 +4661,8 @@ def reject_v2_withdrawal(request_id: int, admin_id: int,
         # Atomic refund
         amount = int(row["amount_cents"] or row["points_amount"] or 0)
         conn.execute(
-            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-            (amount, row["user_id"]),
+            "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
+            (egp_cents_to_wallet_nano(amount), row["user_id"]),
         )
         conn.execute(
             "UPDATE withdrawal_requests SET "
@@ -4748,7 +4812,7 @@ def get_stats() -> dict:
             "SELECT COUNT(*) AS cnt FROM smm_orders"
         ).fetchone()["cnt"]
         balance_total = conn.execute(
-            "SELECT COALESCE(SUM(balance_cents), 0) AS s FROM users"
+            "SELECT COALESCE(SUM(balance_usd_nano), 0) AS s FROM users"
         ).fetchone()["s"]
         referrals_count = conn.execute(
             "SELECT COUNT(*) AS cnt FROM referrals"
@@ -4760,7 +4824,7 @@ def get_stats() -> dict:
     return {
         "users":      users_count,
         "orders":     orders_count,
-        "balance_cents": balance_total,
+        "balance_usd_nano": balance_total,
         "referrals":  referrals_count,
         "today":      today_users,
     }
@@ -4848,7 +4912,7 @@ def handle_required_channel_membership_update(update):
                 user_id,
                 "🎉 <b>تم رصد انضمامك تلقائياً!</b>\n\n"
                 f"✅ القناة: <b>{html.escape(channel['name'])}</b>\n"
-                f"💰 تمت إضافة <b>{format_balance(reward_result['points'])}</b> فوراً إلى رصيدك.\n\n"
+                f"💰 تمت إضافة <b>{format_balance(egp_cents_to_wallet_nano(reward_result['points']))}</b> فوراً إلى رصيدك.\n\n"
                 "أكمل الانضمام لبقية القنوات الإلزامية، ثم اضغط التحقق لفتح كل الميزات.",
             )
         except Exception:
@@ -4862,7 +4926,7 @@ def handle_required_channel_membership_update(update):
     penalized = enforce_channel_subscriptions(user_id, channels)
 
     lines = "\n".join(
-        f"• {html.escape(item['name'])}: -{format_balance(item['deducted_points'])}"
+        f"• {html.escape(item['name'])}: -{format_balance(egp_cents_to_wallet_nano(item['deducted_points']))}"
         for item in penalized
     )
     try:
@@ -5009,7 +5073,7 @@ def category_keyboard(category_key: str) -> InlineKeyboardMarkup:
         label = f"{svc['emoji']} {service_display_name(service_key, svc)}".strip()
         markup.add(InlineKeyboardButton(
             f"{label} — {get_service_quantity(service_key)} وحدة / "
-            f"{format_balance(get_service_price(service_key))}",
+            f"{format_balance(egp_cents_to_wallet_nano(get_service_price(service_key)))}",
             callback_data=f"buy_{service_key}",
         ))
     markup.add(InlineKeyboardButton("🔙 العودة للمنصات", callback_data="shop"))
@@ -5030,7 +5094,7 @@ def tasks_keyboard(channels: list[dict]) -> InlineKeyboardMarkup:
     for ch in channels:
         status = "✅" if ch["rewarded"] else "🔔"
         markup.add(InlineKeyboardButton(
-            f"{status} {ch['name']} — {format_balance(ch['reward'])}",
+            f"{status} {ch['name']} — {format_balance(egp_cents_to_wallet_nano(ch['reward']))}",
             url=f"https://t.me/{ch['username'].lstrip('@')}",
         ))
         if not ch["rewarded"]:
@@ -5132,7 +5196,7 @@ def activation_gate_keyboard(user_id: int) -> InlineKeyboardMarkup:
     for ch in channels:
         status = "✅" if ch["subscribed"] else "🔔"
         markup.add(InlineKeyboardButton(
-            f"{status} {ch['name']} — {format_balance(ch['reward'])}",
+            f"{status} {ch['name']} — {format_balance(egp_cents_to_wallet_nano(ch['reward']))}",
             url=f"https://t.me/{ch['username'].lstrip('@')}",
         ))
         if not ch["subscribed"]:
@@ -5169,14 +5233,14 @@ def build_activation_gate_text(user_id: int) -> str:
         status = "✅ مشترك" if ch["subscribed"] else "⏳ مطلوب"
         text += (
             f"📢 <b>{html.escape(ch['name'])}</b>\n"
-            f"   الحالة: {status} | المكافأة: <b>{format_balance(ch['reward'])}</b>\n\n"
+            f"   الحالة: {status} | المكافأة: <b>{format_balance(egp_cents_to_wallet_nano(ch['reward']))}</b>\n\n"
         )
     if pending_tasks:
         text += "📝 <b>المهام اليدوية المتبقية:</b>\n"
         for task in pending_tasks:
             text += (
                 f"• {html.escape(task['title'])} — "
-                f"<b>{format_balance(task['reward_points'])}</b>\n"
+                f"<b>{format_balance(egp_cents_to_wallet_nano(task['reward_points']))}</b>\n"
             )
         text += "\n"
     else:
@@ -5185,7 +5249,7 @@ def build_activation_gate_text(user_id: int) -> str:
     text += (
         "⚠️ <b>تحذير:</b> مغادرة أي قناة يؤدي إلى خصم مكافأتها وتجميد حسابك فوراً!\n\n"
         "اضغط الزر أدناه بعد الاشتراك في جميع القنوات للتحقق وفتح حسابك.\n"
-        f"🎁 <b>إجمالي مكافآت القنوات:</b> {format_balance(total_ch_reward)}"
+        f"🎁 <b>إجمالي مكافآت القنوات:</b> {format_balance(egp_cents_to_wallet_nano(total_ch_reward))}"
     )
     return text
 
@@ -5269,7 +5333,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
 def service_prices_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton(
-        f"📺 مكافأة مشاهدة الإعلان — {format_balance(get_ad_reward())}",
+        f"📺 مكافأة مشاهدة الإعلان — {format_balance(egp_cents_to_wallet_nano(get_ad_reward()))}",
         callback_data="admin_set_ad_reward",
     ))
     for service_key, service in SERVICE_INDEX.items():
@@ -5277,7 +5341,7 @@ def service_prices_keyboard() -> InlineKeyboardMarkup:
         markup.add(InlineKeyboardButton(
             f"{service['emoji']} {service_display_name(service_key, service)} — "
             f"{get_service_quantity(service_key)} وحدة / "
-            f"{format_balance(selling)}",
+            f"{format_balance(egp_cents_to_wallet_nano(selling))}",
             callback_data=f"admin_service_settings_{service_key}",
         ))
     markup.add(InlineKeyboardButton(
@@ -5302,11 +5366,11 @@ def referral_keyboard(user_id: int) -> InlineKeyboardMarkup:
 # ══════════════════════════════════════════════════════════════════════════════
 # ─── بانيات نصوص الشاشات ─────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-def build_shop_text(balance_cents: int) -> str:
+def build_shop_text(balance_nano: int) -> str:
     lines = [
         "🛒 <b>متجر الخدمات</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"💰 <b>رصيدك الحالي:</b> {format_balance(balance_cents)}\n",
+        f"💰 <b>رصيدك الحالي:</b> {format_balance(balance_nano)}\n",
         "اختر المنصة أولاً لعرض خدماتها:",
         "",
     ]
@@ -5439,7 +5503,7 @@ def build_tasks_text(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             "⭕ <b>لم تشترك بعد</b>"
         )
         text += (
-            f"  • {html.escape(ch['name'])} — <b>{format_balance(ch['reward'])}</b>\n"
+            f"  • {html.escape(ch['name'])} — <b>{format_balance(egp_cents_to_wallet_nano(ch['reward']))}</b>\n"
             f"    الحالة: {ch_status}\n"
         )
     text += "\n<i>💡 اضغط على اسم القناة للاشتراك ثم اضغط «تحقق من الاشتراك».</i>"
@@ -5453,7 +5517,7 @@ def build_tasks_text(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             text += (
                 f"👥 <b>مهمة إحالة #{task['id']}</b>\n"
                 f"🔗 <code>{html.escape(task['referral_link'])}</code>\n"
-                f"🎁 المكافأة: <b>{format_balance(REFERRAL_REWARD)}</b>\n"
+                f"🎁 المكافأة: <b>{format_balance(REFERRAL_REWARD_USD_NANO)}</b>\n"
                 f"📊 المتبقي: <b>{task['quantity_remaining']}</b> إحالة\n\n"
             )
     if manual_tasks:
@@ -5468,7 +5532,7 @@ def build_tasks_text(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 f"⚙️ النوع: <b>{manual_task_type_label(task)}</b>\n"
                 f"🎯 الهدف: <code>{html.escape(manual_task_target(task))}</code>\n"
                 f"📋 الشروط: {html.escape(manual_task_instructions(task))}\n"
-                f"🎁 المكافأة: <b>{format_balance(task['reward_points'])}</b>\n"
+                f"🎁 المكافأة: <b>{format_balance(egp_cents_to_wallet_nano(task['reward_points']))}</b>\n"
                 f"📊 المتبقي: <b>{task['quantity_remaining']}</b> تنفيذ\n\n"
             )
 
@@ -5658,7 +5722,7 @@ def cmd_start(message):
                         stored_ref_id,
                         f"🎉 <b>تم تسجيل إحالة معلّقة!</b>\n\n"
                         f"✅ انضم <b>{newcomer_name}</b> عبر رابطك.\n"
-                        f"💰 ستُضاف مكافأة الإحالة <b>{format_balance(REFERRAL_REWARD)}</b> "
+                        f"💰 ستُضاف مكافأة الإحالة <b>{format_balance(REFERRAL_REWARD_USD_NANO)}</b> "
                         "فور تحقق شروط فتح الحساب.",
                     )
                 except Exception:
@@ -5801,10 +5865,10 @@ def handle_admin_manual_review_reply(message):
         bot.send_message(
             user_id,
             "🎉 <b>تم قبول إثبات المهمة!</b>\n\n"
-            f"✅ تمت إضافة <b>{format_balance(approved['reward_points'])}</b> إلى رصيدك.\n"
+            f"✅ تمت إضافة <b>{format_balance(egp_cents_to_wallet_nano(approved['reward_points']))}</b> إلى رصيدك.\n"
             + (
                 f"🔓 تم تفعيل حسابك وإضافة مكافأة التفعيل "
-                f"<b>{format_balance(ACTIVATION_REWARD)}</b>."
+                f"<b>{format_balance(ACTIVATION_REWARD_USD_NANO)}</b>."
                 if activated
                 else "سيتم تحديث واجهتك بعد اكتمال بقية الشروط."
             )
@@ -5854,7 +5918,7 @@ def handle_admin_ad_review_reply(message):
         bot.send_message(
             approved["user_id"],
             "🎉 <b>تم قبول إثبات الإعلان!</b>\n\n"
-            f"✅ تمت إضافة <b>{format_balance(approved['reward_points'])}</b> إلى رصيدك.\n"
+            f"✅ تمت إضافة <b>{format_balance(egp_cents_to_wallet_nano(approved['reward_points']))}</b> إلى رصيدك.\n"
             f"🏆 <b>رصيدك الحالي:</b> {balance_text(updated)}",
             reply_markup=main_keyboard(),
         )
@@ -5923,7 +5987,7 @@ def handle_admin_withdrawal_reply(message):
         bot.send_message(
             completed["user_id"],
             "🎉 <b>تم تحويل أرباحك بنجاح!</b>\n\n"
-        f"تم اعتماد طلب سحب <b>{format_balance(completed['amount_cents'] or completed['points_amount'])}</b> "
+        f"تم اعتماد طلب سحب <b>{format_balance(egp_cents_to_wallet_nano(completed['amount_cents'] or completed['points_amount']))}</b> "
             "وإرسال المبلغ إلى حسابك.\n"
             "شكراً لاستخدامك البوت 💰",
         )
@@ -5993,7 +6057,7 @@ def handle_referral_task_complaint_photo(message):
         f"• <b>حساب Telegram:</b> {username}\n"
         f"• <b>المعلن:</b> <code>{claim['buyer_id']}</code>\n"
         f"• <b>التعويض عند الاعتماد:</b> "
-        f"<b>{format_balance(REFERRAL_REWARD)}</b>\n\n"
+        f"<b>{format_balance(REFERRAL_REWARD_USD_NANO)}</b>\n\n"
         "راجع صورة الإثبات واختر اعتماد الشكوى أو رفضها."
     )
     try:
@@ -6064,7 +6128,7 @@ def handle_manual_task_proof(message):
         f"• <b>المعرف الرقمي:</b> <code>{user_id}</code>\n"
         f"• <b>اسم المستخدم:</b> {display_name}\n"
         f"• <b>حساب Telegram:</b> {username}\n"
-        f"• <b>المكافأة:</b> <b>{format_balance(task['reward_points'])}</b>\n\n"
+        f"• <b>المكافأة:</b> <b>{format_balance(egp_cents_to_wallet_nano(task['reward_points']))}</b>\n\n"
         "↩️ رد على هذه الرسالة بكلمة <b>تم</b> أو <b>مقبول</b> لاعتماد المهمة."
     )
     try:
@@ -6131,7 +6195,7 @@ def handle_ad_proof(message):
         f"• <b>حساب Telegram:</b> {username}\n"
         f"• <b>الإعلان:</b> "
         f"{html.escape(selected_ad['title']) if selected_ad else 'الإعلان الأساسي'}\n"
-        f"• <b>المكافأة:</b> <b>{format_balance(review['reward_cents'] if review else get_ad_reward())}</b>\n"
+        f"• <b>المكافأة:</b> <b>{format_balance(egp_cents_to_wallet_nano(review['reward_cents'] if review else get_ad_reward()))}</b>\n"
         + (
             f"• <b>رابط الإعلان:</b> <code>{html.escape(selected_ad['url'])}</code>\n"
             if selected_ad is not None
@@ -6173,7 +6237,7 @@ def handle_withdrawal_amount(message):
         bot.send_message(
             message.chat.id,
             f"⚠️ أدخل مبلغاً صحيحاً لا يقل عن "
-            f"<b>{format_balance(get_min_withdrawal())}</b>.",
+            f"<b>{format_balance(egp_cents_to_wallet_nano(get_min_withdrawal()))}</b>.",
         )
         return
 
@@ -7200,8 +7264,8 @@ def handle_service_price_input(message):
         admin_id,
         "✅ <b>تم تحديث سعر الخدمة بنجاح</b>\n\n"
         f"الخدمة: <b>{html.escape(service_display_name(service_key, service))}</b>\n"
-        f"📌 التكلفة الأساسية: <b>{format_balance(price)}</b>\n"
-        f"💰 سعر البيع للعميل: <b>{format_balance(selling)}</b>\n"
+        f"📌 التكلفة الأساسية: <b>{format_balance(egp_cents_to_wallet_nano(price))}</b>\n"
+        f"💰 سعر البيع للعميل: <b>{format_balance(egp_cents_to_wallet_nano(selling))}</b>\n"
         f"📊 هامش المنصة: <b>{int((MARGIN_MULTIPLIER - 1) * 100)}%</b>",
         reply_markup=admin_keyboard(),
     )
@@ -7361,7 +7425,7 @@ def handle_watch_ad_link_input(message):
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 العنوان: <b>{html.escape(ad['title'])}</b>\n"
         f"🔗 الرابط: <code>{html.escape(ad['url'])}</code>\n"
-        f"💰 المكافأة الحالية: <b>{format_balance(get_ad_reward())}</b>",
+        f"💰 المكافأة الحالية: <b>{format_balance(egp_cents_to_wallet_nano(get_ad_reward()))}</b>",
         reply_markup=admin_keyboard(),
     )
 
@@ -7449,7 +7513,7 @@ def handle_link_input(message):
         f"{svc['emoji']} <b>الخدمة:</b> {service_display_name(service_key, svc)}\n"
         f"🔢 <b>الكمية:</b> {svc['quantity']}\n"
         f"🔗 <b>الرابط:</b> <code>{link}</code>\n"
-        f"💰 <b>التكلفة:</b> {format_balance(get_service_price(service_key))}\n"
+        f"💰 <b>التكلفة:</b> {format_balance(egp_cents_to_wallet_nano(get_service_price(service_key)))}\n"
         f"💼 <b>رصيدك:</b> {balance_text(row)}\n\n"
         f"هل تريد تأكيد الطلب؟"
     )
@@ -7495,7 +7559,7 @@ def handle_referral_link_input(message):
         bot.send_message(
             message.chat.id,
             f"❌ رصيدك غير كافٍ لإنشاء الطلب.\n"
-            f"تحتاج إلى <b>{format_balance(price)}</b> لشراء "
+            f"تحتاج إلى <b>{format_balance(egp_cents_to_wallet_nano(price))}</b> لشراء "
             f"{get_service_quantity(REFERRAL_SERVICE_KEY)} إحالة.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("💳 شراء نقاط", callback_data="buy_points"),
@@ -7514,7 +7578,7 @@ def handle_referral_link_input(message):
         f"🔢 <b>الكمية:</b> {get_service_quantity(REFERRAL_SERVICE_KEY)} إحالة\n"
         f"🔗 <b>الرابط:</b> <code>{html.escape(link)}</code>\n"
         f"🆔 <b>رقم الطلب:</b> <code>{task_id}</code>\n"
-        f"💰 <b>التكلفة:</b> {format_balance(price)}\n"
+        f"💰 <b>التكلفة:</b> {format_balance(egp_cents_to_wallet_nano(price))}\n"
         f"💼 <b>رصيدك المتبقي:</b> {balance_text(updated)}\n\n"
         "سيظهر الرابط الآن للمستخدمين الآخرين ضمن «المهام اليومية».",
         reply_markup=InlineKeyboardMarkup([
@@ -7748,7 +7812,7 @@ def handle_user_ad_price(message):
         f"📝 <b>الوصف:</b>\n{html.escape(description)}\n\n"
         f"🔗 <b>الرابط:</b> <code>{html.escape(link)}</code>\n"
         f"💰 <b>السعر:</b> "
-        f"{'مجاني' if price == 0 else format_balance(price)}\n\n"
+        f"{'مجاني' if price == 0 else format_balance(egp_cents_to_wallet_nano(price))}\n\n"
         "إذا كانت البيانات صحيحة اضغط «🚀 نشر الإعلان».",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🚀 نشر الإعلان", callback_data="publish_user_ad")],
@@ -7832,7 +7896,7 @@ def callback_publish_user_ad(call):
         f"📝 <b>الوصف:</b>\n{html.escape(description)}\n\n"
         f"🔗 <b>الرابط:</b> <code>{html.escape(link)}</code>\n"
         f"💰 <b>السعر:</b> "
-        f"{'مجاني' if price == 0 else format_balance(price)}\n\n"
+        f"{'مجاني' if price == 0 else format_balance(egp_cents_to_wallet_nano(price))}\n\n"
         "اختر قرار المراجعة من الأزرار أدناه."
     )
 
@@ -8237,7 +8301,7 @@ def admin_watch_ads_text() -> str:
         "📺 <b>إدارة إعلانات المشاهدة</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
-        f"💰 مكافأة المشاهدة الحالية: <b>{format_balance(get_ad_reward())}</b>",
+        f"💰 مكافأة المشاهدة الحالية: <b>{format_balance(egp_cents_to_wallet_nano(get_ad_reward()))}</b>",
         "",
         "اضغط على الإعلان لتغيير ظهوره للمستخدمين:",
         "",
@@ -8279,7 +8343,7 @@ def callback_admin_watch_ad_reward(call):
     bot.edit_message_text(
         "💰 <b>تعديل مكافأة مشاهدة الإعلان</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"المكافأة الحالية: <b>{format_balance(get_ad_reward())}</b>\n\n"
+        f"المكافأة الحالية: <b>{format_balance(egp_cents_to_wallet_nano(get_ad_reward()))}</b>\n\n"
         "أرسل المكافأة الجديدة بالجنيه أو الدولار، مثل:\n"
         "• <code>0.50</code>\n"
         "• <code>$0.01</code>",
@@ -8351,7 +8415,7 @@ def callback_admin_service_prices(call):
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "اختر الخدمة ثم عدّل السعر أو الكمية بشكل مستقل.\n"
         f"📺 مكافأة مشاهدة الإعلان الحالية: "
-        f"<b>{format_balance(get_ad_reward())}</b>\n\n"
+        f"<b>{format_balance(egp_cents_to_wallet_nano(get_ad_reward()))}</b>\n\n"
         "مثال: الكمية <b>1</b> متابع والسعر <b>0.50 جنيه</b>.\n"
         "السعر والكمية يجب أن يكونا أكبر من صفر."
     )
@@ -8374,7 +8438,7 @@ def callback_admin_set_ad_reward(call):
     bot.edit_message_text(
         "📺 <b>تعديل مكافأة مشاهدة الإعلان</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"المكافأة الحالية: <b>{format_balance(get_ad_reward())}</b>\n\n"
+        f"المكافأة الحالية: <b>{format_balance(egp_cents_to_wallet_nano(get_ad_reward()))}</b>\n\n"
         "أرسل المكافأة الجديدة بالجنيه أو الدولار، مثل:\n"
         "• <code>0.50</code>\n"
         "• <code>$0.01</code>\n\n"
@@ -8444,7 +8508,7 @@ def callback_admin_set_price(call):
     bot.edit_message_text(
         f"⚙️ <b>تعديل سعر الخدمة</b>\n\n"
         f"الخدمة: <b>{html.escape(service_display_name(service_key, service))}</b>\n"
-        f"السعر الحالي: <b>{format_balance(get_service_price(service_key))}</b>\n\n"
+        f"السعر الحالي: <b>{format_balance(egp_cents_to_wallet_nano(get_service_price(service_key)))}</b>\n\n"
         "أرسل السعر الجديد بالجنيه أو الدولار، مثل 12.35 أو $0.50.\n\n"
         "أرسل /admin للإلغاء والعودة للوحة التحكم.",
         chat_id=call.message.chat.id,
@@ -8490,7 +8554,7 @@ def callback_admin_service_settings(call):
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"الخدمة: <b>{html.escape(service_display_name(service_key, service))}</b>\n"
         f"📌 التكلفة الأساسية: <b>{format_balance(get_service_base_cost(service_key))}</b>\n"
-        f"💰 سعر البيع (العميل): <b>{format_balance(get_service_price(service_key))}</b>\n"
+        f"💰 سعر البيع (العميل): <b>{format_balance(egp_cents_to_wallet_nano(get_service_price(service_key)))}</b>\n"
         f"📊 هامش المنصة: <b>{int((MARGIN_MULTIPLIER - 1) * 100)}%</b>\n"
         f"🔢 الكمية الحالية: <b>{get_service_quantity(service_key)} وحدة</b>\n\n"
         "اختر الإعداد الذي تريد تغييره.",
@@ -8947,7 +9011,7 @@ def callback_earn_points(call):
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "📣 <b>كيف تعمل؟</b>\n"
         "• شارك رابطك الخاص مع أصدقائك.\n"
-        f"• تربح <b>{format_balance(REFERRAL_REWARD)}</b> عن كل صديق "
+        f"• تربح <b>{format_balance(REFERRAL_REWARD_USD_NANO)}</b> عن كل صديق "
         "ينضم عبر رابطك ويفتح حسابه بعد تحقق الشروط. 🎁\n"
         "• تُصرف المكافأة فور فتح الحساب، بدون انتظار أو احتجاز.\n\n"
         f"🔗 <b>رابطك الخاص:</b>\n"
@@ -9005,7 +9069,7 @@ def callback_watch_ads(call):
     bot.edit_message_text(
         "📺 <b>إعلانات المشاهدة</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎁 شاهد إعلاناً بالكامل لتكسب <b>{format_balance(get_ad_reward())}</b> "
+        f"🎁 شاهد إعلاناً بالكامل لتكسب <b>{format_balance(egp_cents_to_wallet_nano(get_ad_reward()))}</b> "
         "بعد موافقة الإدارة.\n\n"
         "اختر إعلاناً للمتابعة:",
         chat_id=call.message.chat.id,
@@ -9061,7 +9125,7 @@ def callback_watch_ad(call):
     bot.answer_callback_query(call.id)
     bot.edit_message_text(
         f"🎁 شاهد <b>{html.escape(ad['title'])}</b> بالكامل لتكسب "
-        f"<b>{format_balance(get_ad_reward())}</b> مجاناً!\n\n"
+        f"<b>{format_balance(egp_cents_to_wallet_nano(get_ad_reward()))}</b> مجاناً!\n\n"
         "بعد الانتهاء، اضغط «فتح الإعلان» ثم أرسل هنا صورة لقطة شاشة "
         "تثبت المشاهدة. سيتم إرسالها إلى الإدارة للمراجعة قبل إضافة النقاط.",
         chat_id=call.message.chat.id,
@@ -9212,7 +9276,7 @@ def callback_claim_referral(call):
                     f"🔢 <b>رقم الطلب:</b> <code>{task_id}</code>\n"
                     f"👤 <b>المؤدي:</b> <code>{user_id}</code>\n"
                     f"💰 <b>المكافأة عند الموافقة:</b> "
-                    f"<b>{format_balance(REFERRAL_REWARD)}</b>\n\n"
+                    f"<b>{format_balance(REFERRAL_REWARD_USD_NANO)}</b>\n\n"
                     "راجع تنفيذ المهمة ثم اختر الموافقة أو الرفض:",
                     reply_markup=referral_claim_decision_keyboard(claim["id"]),
                 )
@@ -9284,7 +9348,7 @@ def callback_approve_referral_claim(call):
         bot.send_message(
             worker_id,
             "🎉 <b>وافق صاحب الطلب على تنفيذك!</b>\n\n"
-            f"✅ تمت إضافة <b>{format_balance(REFERRAL_REWARD)}</b> إلى رصيدك.\n"
+            f"✅ تمت إضافة <b>{format_balance(REFERRAL_REWARD_USD_NANO)}</b> إلى رصيدك.\n"
             f"🏆 <b>رصيدك الحالي:</b> {balance_text(worker_balance)}",
         )
     except Exception:
@@ -9416,7 +9480,7 @@ def callback_approve_referral_complaint(call):
         bot.send_message(
             approved["worker_id"],
             "🎉 <b>تم اعتماد شكواك</b>\n\n"
-            f"تمت إضافة <b>{format_balance(REFERRAL_REWARD)}</b> إلى رصيدك "
+            f"تمت إضافة <b>{format_balance(REFERRAL_REWARD_USD_NANO)}</b> إلى رصيدك "
             "بعد ثبوت تنفيذ المهمة.",
         )
     except Exception:
@@ -9426,7 +9490,7 @@ def callback_approve_referral_complaint(call):
             approved["buyer_id"],
             "⚠️ <b>إنذار بخصوص تنفيذ مهمة مدفوعة</b>\n\n"
             f"اعتمدت الإدارة شكوى المؤدي في الطلب <code>{approved['task_id']}</code>.\n"
-            f"تم خصم <b>{format_balance(REFERRAL_REWARD)}</b> من رصيدك "
+            f"تم خصم <b>{format_balance(REFERRAL_REWARD_USD_NANO)}</b> من رصيدك "
             "وإيداعها للمؤدي.\n"
             "يرجى مراجعة التنفيذات وعدم رفض التنفيذ الصحيح.",
         )
@@ -9777,7 +9841,7 @@ def callback_verify_activation(call):
 
     activation_text = (
         "🎉 <b>تم تفعيل حسابك بنجاح!</b>\n\n"
-        f"🎁 تمت إضافة <b>{format_balance(ACTIVATION_REWARD)}</b> كمكافأة تفعيل إضافية.\n"
+        f"🎁 تمت إضافة <b>{format_balance(ACTIVATION_REWARD_USD_NANO)}</b> كمكافأة تفعيل إضافية.\n"
         if activated else
         "✅ <b>تم التحقق من شروط حسابك بنجاح!</b>\n\n"
     )
@@ -10040,7 +10104,7 @@ def callback_confirm_order(call):
         bot.edit_message_text(
             f"❌ <b>فشل الطلب — تم استرداد نقاطك</b>\n\n"
             f"الخطأ: {result['error']}\n\n"
-            f"تم إرجاع <b>{format_balance(price)}</b> إلى رصيدك.",
+            f"تم إرجاع <b>{format_balance(egp_cents_to_wallet_nano(price))}</b> إلى رصيدك.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=InlineKeyboardMarkup([

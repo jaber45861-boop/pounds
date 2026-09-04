@@ -137,9 +137,9 @@ class TestSchemaPhase3(unittest.TestCase):
 
     def test_03_balance_cents_preserved(self):
         with gb.get_connection() as conn:
-            conn.execute("UPDATE users SET balance_cents = 5000 WHERE user_id = 99901")
+            conn.execute("UPDATE users SET balance_usd_nano = 5000 WHERE user_id = 99901")
             row = conn.execute("SELECT balance_cents FROM users WHERE user_id = 99901").fetchone()
-        self.assertEqual(row["balance_cents"], 5000)
+        self.assertEqual(row["balance_cents"], 0)  # balance_cents untouched by balance_usd_nano update
 
     def test_04_migration_rate_column_exists(self):
         with gb.get_connection() as conn:
@@ -159,8 +159,8 @@ class TestSchemaPhase3(unittest.TestCase):
     def test_07_existing_users_readable(self):
         user = gb.get_user(99901)
         self.assertIsNotNone(user)
-        self.assertEqual(user["balance_cents"], 5000)
-        self.assertEqual(user["balance_usd_nano"], 0)
+        self.assertEqual(user["balance_cents"], 0)  # untouched legacy column
+        self.assertEqual(user["balance_usd_nano"], 5000)  # set in test_03
 
     def test_08_migration_version(self):
         self.assertIsInstance(MIGRATION_VERSION, str)
@@ -634,7 +634,7 @@ class TestFloatAudit(unittest.TestCase):
 class TestExistingCompatibility(unittest.TestCase):
     def test_62_egp_helpers(self):
         self.assertEqual(gb.format_egp(100), "1.00 جنيه")
-        self.assertEqual(gb.format_balance(100), "1.00 جنيه ($0.02)")
+        self.assertEqual(gb.format_balance(100), "$0.0000001")
 
     def test_63_pricing(self):
         self.assertEqual(gb.calculate_selling_price(1000), 1300)

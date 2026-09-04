@@ -215,7 +215,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute("DELETE FROM users WHERE user_id = 999")
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
                 "VALUES (999, 'Test', 100000, 1, 1, 0)"
             )
@@ -269,7 +269,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
     def test_40_insufficient_balance_rejected(self):
         with gb.get_connection() as conn:
             conn.execute(
-                "UPDATE users SET balance_cents = 500 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 500 WHERE user_id = 999"
             )
             conn.commit()
         result = gb.create_v2_withdrawal_request(
@@ -282,7 +282,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         self.assertEqual(result, "insufficient_balance")
         with gb.get_connection() as conn:
             conn.execute(
-                "UPDATE users SET balance_cents = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
             )
             conn.commit()
 
@@ -398,10 +398,10 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute(
-                "UPDATE users SET balance_cents = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
             )
             conn.commit()
-        before = gb.get_user(999)["balance_cents"]
+        before = gb.get_user(999)["balance_usd_nano"]
         gb.create_v2_withdrawal_request(
             user_id=999,
             method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
@@ -409,17 +409,17 @@ class TestV2WithdrawalCreation(unittest.TestCase):
             requested_egp_cents=1000,
             usdt_amount=None,
         )
-        after = gb.get_user(999)["balance_cents"]
+        after = gb.get_user(999)["balance_usd_nano"]
         self.assertEqual(before - after, 1000)
 
     def test_49_failed_create_does_not_deduct(self):
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute(
-                "UPDATE users SET balance_cents = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
             )
             conn.commit()
-        before = gb.get_user(999)["balance_cents"]
+        before = gb.get_user(999)["balance_usd_nano"]
         result = gb.create_v2_withdrawal_request(
             user_id=999,
             method_code=gb.WITHDRAWAL_METHOD_VODAFONE,
@@ -427,7 +427,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
             requested_egp_cents=499,  # below dynamic minimum (5.00 EGP at rate 50)
             usdt_amount=None,
         )
-        after = gb.get_user(999)["balance_cents"]
+        after = gb.get_user(999)["balance_usd_nano"]
         self.assertEqual(result, "below_minimum")
         self.assertEqual(before, after)
 
@@ -435,7 +435,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute(
-                "UPDATE users SET balance_cents = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
             )
             conn.commit()
         rid = gb.create_v2_withdrawal_request(
@@ -454,7 +454,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute(
-                "UPDATE users SET balance_cents = 100000 WHERE user_id = 999"
+                "UPDATE users SET balance_usd_nano = 100000 WHERE user_id = 999"
             )
             conn.commit()
         gb._save_rate_snapshot(Decimal("50.00"), "test")
@@ -490,7 +490,7 @@ class TestV2AdminFlow(unittest.TestCase):
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute("DELETE FROM users WHERE user_id = 888")
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
                 "VALUES (888, 'T', 50000, 1, 1, 0)"
             )
@@ -505,9 +505,9 @@ class TestV2AdminFlow(unittest.TestCase):
             requested_egp_cents=1000,
             usdt_amount=None,
         )
-        before = gb.get_user(888)["balance_cents"]
+        before = gb.get_user(888)["balance_usd_nano"]
         result = gb.complete_v2_withdrawal(rid, 1, "TX-123")
-        after = gb.get_user(888)["balance_cents"]
+        after = gb.get_user(888)["balance_usd_nano"]
         self.assertIsNotNone(result)
         self.assertEqual(before, after)
         self.assertEqual(result["status"], "completed")
@@ -520,15 +520,15 @@ class TestV2AdminFlow(unittest.TestCase):
             requested_egp_cents=1000,
             usdt_amount=None,
         )
-        before = gb.get_user(888)["balance_cents"]
+        before = gb.get_user(888)["balance_usd_nano"]
         result = gb.reject_v2_withdrawal(rid, 1)
-        after = gb.get_user(888)["balance_cents"]
+        after = gb.get_user(888)["balance_usd_nano"]
         self.assertIsNotNone(result)
-        self.assertEqual(after - before, 1000)
+        self.assertEqual(after - before, gb.egp_cents_to_wallet_nano(1000))
         # Second refund attempt must be no-op
         result2 = gb.reject_v2_withdrawal(rid, 1)
         self.assertIsNone(result2)
-        final = gb.get_user(888)["balance_cents"]
+        final = gb.get_user(888)["balance_usd_nano"]
         self.assertEqual(final, after)
 
     def test_54_cannot_complete_already_completed(self):
@@ -744,7 +744,7 @@ class TestVodafoneEnforcementAtRate(unittest.TestCase):
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute("DELETE FROM users WHERE user_id = 555")
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
                 "VALUES (555, 'T', 1000000, 1, 1, 0)"
             )
@@ -986,7 +986,7 @@ class TestWithdrawalEntryGate(unittest.TestCase):
         # Create a user with balance
         with gb.get_connection() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO users (user_id, first_name, balance_cents) "
+                "INSERT OR REPLACE INTO users (user_id, first_name, balance_usd_nano) "
                 "VALUES (8888, 'Test', 10000)"
             )
             conn.commit()
@@ -1016,11 +1016,11 @@ class TestWithdrawalEntryGate(unittest.TestCase):
         )
         self.assertIsInstance(result, int)
         with gb.get_connection() as conn:
-            user = conn.execute("SELECT balance_cents FROM users WHERE user_id = 8888").fetchone()
-            self.assertLess(user["balance_cents"], 10000)
+            user = conn.execute("SELECT balance_usd_nano FROM users WHERE user_id = 8888").fetchone()
+            self.assertLess(user["balance_usd_nano"], 10000)
             # Refund
             conn.execute("DELETE FROM withdrawal_requests WHERE user_id = 8888")
-            conn.execute("UPDATE users SET balance_cents = 10000 WHERE user_id = 8888")
+            conn.execute("UPDATE users SET balance_usd_nano = 10000 WHERE user_id = 8888")
             conn.commit()
 
 
@@ -1124,19 +1124,19 @@ class TestCallbackEntryGateRegression(unittest.TestCase):
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute("DELETE FROM users WHERE user_id IN (7001, 7002, 7003)")
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
-                "VALUES (7001, 'SevenEGP', 700, 1, 1, 0)"
+                "VALUES (7001, 'SevenEGP', 140000000, 1, 1, 0)"
             )
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
-                "VALUES (7002, 'ThreeEGP', 300, 1, 1, 0)"
+                "VALUES (7002, 'ThreeEGP', 60000000, 1, 1, 0)"
             )
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
-                "VALUES (7003, 'BigBalance', 5000, 1, 1, 0)"
+                "VALUES (7003, 'BigBalance', 1000000000, 1, 1, 0)"
             )
             conn.commit()
         # Patch bot interface and bypass external-only checks.
@@ -1194,7 +1194,7 @@ class TestCallbackEntryGateRegression(unittest.TestCase):
         self.assertIn("سحب الأرباح", rendered)
         self.assertIn("اختر طريقة السحب", rendered)
         # 4. The user's actual balance must be displayed in the header.
-        self.assertIn("7.00", rendered)
+        self.assertIn("$0.14", rendered)
         # 5. The keyboard MUST be the V2 method selector.
         self.assertIn("withdraw_v2_vodafone", rendered_buttons,
                       "Vodafone button missing from method selector keyboard")
@@ -1204,7 +1204,7 @@ class TestCallbackEntryGateRegression(unittest.TestCase):
         #    (it is method-specific now).
         # 7.00 EGP balance + Vodafone min 5.00 EGP proves the user can
         # proceed; the rendered text would be misleading otherwise.
-        self.assertNotIn("10.00", rendered,
+        self.assertNotIn("$0.20", rendered,
                          "Legacy 10.00 EGP minimum still shown to customer")
 
     def test_85_three_egp_user_also_reaches_method_selector(self):
@@ -1221,7 +1221,7 @@ class TestCallbackEntryGateRegression(unittest.TestCase):
         rendered_buttons = self._collect_callback_data(edit["reply_markup"])
 
         self.assertNotIn("اجمع المزيد", edit["text"])
-        self.assertIn("3.00", edit["text"])
+        self.assertIn("$0.06", edit["text"])
         self.assertIn("withdraw_v2_vodafone", rendered_buttons)
         self.assertIn("withdraw_v2_usdt", rendered_buttons)
 
@@ -1235,7 +1235,7 @@ class TestCallbackEntryGateRegression(unittest.TestCase):
         self.assertTrue(self.recorder.edits)
         edit = self.recorder.edits[-1]
         rendered_buttons = self._collect_callback_data(edit["reply_markup"])
-        self.assertIn("50.00", edit["text"])
+        self.assertIn("$1.00", edit["text"])
         self.assertIn("withdraw_v2_vodafone", rendered_buttons)
         self.assertIn("withdraw_v2_usdt", rendered_buttons)
 
@@ -1304,12 +1304,12 @@ class TestV2VodafoneBoundaryAtRate50(unittest.TestCase):
             conn.execute("DELETE FROM currency_settings")
             conn.execute("DELETE FROM users WHERE user_id IN (8001, 8002)")
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
                 "VALUES (8001, 'Boundary', 500, 1, 1, 0)"
             )
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "INSERT INTO users (user_id, first_name, balance_usd_nano, "
                 "activation_status, is_verified, withdrawal_blocked) "
                 "VALUES (8002, 'Boundary', 499, 1, 1, 0)"
             )

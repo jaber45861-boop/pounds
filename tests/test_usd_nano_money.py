@@ -458,10 +458,10 @@ class TestExistingEgpCentHelpersUnchanged(unittest.TestCase):
         self.assertEqual(gb.format_usd(100), "$0.02")
 
     def test_format_balance_basic(self):
-        self.assertEqual(gb.format_balance(100), "1.00 جنيه ($0.02)")
+        self.assertEqual(gb.format_balance(100_000_000), "$0.10")
 
     def test_format_balance_zero(self):
-        self.assertEqual(gb.format_balance(0), "0.00 جنيه ($0.00)")
+        self.assertEqual(gb.format_balance(0), "$0.00")
 
     def test_parse_money_to_cents_basic(self):
         self.assertEqual(gb.parse_money_to_cents("1.50"), 150)

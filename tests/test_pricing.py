@@ -32,6 +32,7 @@ calculate_selling_price = _mod.calculate_selling_price
 MARGIN_MULTIPLIER = _mod.MARGIN_MULTIPLIER
 parse_currency_input = _mod.parse_currency_input
 format_balance = _mod.format_balance
+egp_cents_to_wallet_nano = _mod.egp_cents_to_wallet_nano
 get_service_price = _mod.get_service_price
 get_service_base_cost = _mod.get_service_base_cost
 set_service_price = _mod.set_service_price
@@ -95,8 +96,8 @@ class TestPricingMargin(unittest.TestCase):
         self.assertEqual(base_cents, 5000)
         selling_cents = calculate_selling_price(base_cents)
         self.assertEqual(selling_cents, 6500)
-        display = format_balance(selling_cents)
-        self.assertIn("65.00", display)
+        display = format_balance(egp_cents_to_wallet_nano(selling_cents))
+        self.assertIn("$1.30", display)
 
     def test_set_service_price_stores_base_cost(self):
         service_key = "tg_100"
