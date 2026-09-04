@@ -23,10 +23,20 @@ import importlib.util as _ilu
 
 
 def _load_bot_module():
-    """Load ganaihat_bot module for access to migration functions."""
+    """Load ganaihat_bot module for access to migration functions.
+
+    IMPORTANT: The pre-set ``EGP_PER_USD`` is an import-compatibility
+    attribute ONLY.  It exists solely to satisfy the module-level
+    ``EGP_PER_USD`` reference during ``exec_module``.  It is NOT a
+    migration rate.  All migration functions (``preview_legacy_migration``,
+    ``run_legacy_migration``, ``egp_cents_to_usd_nano``) require an
+    explicit ``rate`` parameter and never read this module attribute.
+    """
     bot_path = Path(__file__).parent / "ganaihat_bot.py"
     spec = _ilu.spec_from_file_location("ganaihat_bot", str(bot_path))
     mod = _ilu.module_from_spec(spec)
+    # Import-compatibility only — NOT a migration rate.
+    # The module body will overwrite this with its own env-based value.
     mod.EGP_PER_USD = Decimal("50")
     spec.loader.exec_module(mod)
     return mod
@@ -597,6 +607,15 @@ def generate_readiness_report(
 
     # Offline rehearsal if rate supplied
     if rate is not None:
+        # Schema must be complete before rehearsal can run
+        if report.get("migration_schema_status") != "complete":
+            report["blockers"] = ["migration_schema"]
+            report["status"] = "BLOCKED"
+            report["reconciliation_status"] = "not_rehearsed"
+            report["reconciliation"] = {}
+            report["invariants"] = {}
+            return report
+
         rehearsal = run_offline_rehearsal(db_path, rate)
         report["rehearsal"] = rehearsal
         report["rehearsal_status"] = rehearsal.get("status", "unknown")
@@ -609,6 +628,8 @@ def generate_readiness_report(
             blockers.append("partial_migrations")
         if report["integrity_status"] != "ok":
             blockers.append("integrity_failure")
+        if report.get("migration_schema_status") != "complete":
+            blockers.append("migration_schema")
         if rehearsal.get("status") != "READY_FOR_CUTOVER_REVIEW":
             blockers.append(f"rehearsal_{rehearsal.get('status', 'unknown')}")
 

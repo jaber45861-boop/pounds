@@ -100,6 +100,23 @@ def _create_test_db(path, users=None):
         package_key TEXT PRIMARY KEY, label TEXT, target_subscribers INTEGER,
         points_cost INTEGER NOT NULL
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS migration_meta (
+        migration_id TEXT PRIMARY KEY,
+        version TEXT NOT NULL,
+        source_currency TEXT NOT NULL,
+        target_currency TEXT NOT NULL,
+        egp_per_usd TEXT NOT NULL,
+        source_unit TEXT NOT NULL,
+        target_unit TEXT NOT NULL,
+        rounding_mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME,
+        rows_migrated INTEGER DEFAULT 0,
+        rows_skipped INTEGER DEFAULT 0,
+        total_legacy_cents INTEGER DEFAULT 0,
+        total_converted_nano INTEGER DEFAULT 0
+    )""")
     if users:
         for uid, cents in users:
             conn.execute(
@@ -372,13 +389,63 @@ class Test9_Reconciliation(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_21_nonzero_reconciliation_blocks(self):
+    def test_21_real_reconciliation_mismatch(self):
+        """Real mismatch: _reconcile_all detects genuine expected != actual."""
         fd, path = tempfile.mkstemp(suffix=".db")
         _create_test_db(path, users=[(12001, 5000)])
         try:
-            report = mr.generate_readiness_report(path, rate=Decimal("50"))
-            # Should be READY_FOR_CUTOVER_REVIEW
-            self.assertEqual(report["status"], "READY_FOR_CUTOVER_REVIEW")
+            # Pre-migration snapshot: user has 5000 EGP cents
+            pre_snapshot = {
+                "users": [{"user_id": 12001, "balance_cents": 5000}],
+                "count": 1,
+            }
+            # Post-migration snapshot: balance_usd_nano is WRONG
+            # 5000 cents at rate 50 → 1,000,000,000 nano expected
+            # but actual is 999 (genuinely wrong)
+            post_snapshot = {
+                "users": [{
+                    "user_id": 12001,
+                    "balance_cents": 5000,
+                    "balance_usd_nano": 999,
+                    "balance_usd_nano_rate": "50",
+                    "balance_usd_nano_migrated_at": "2026-01-01",
+                }],
+                "count": 1,
+            }
+            result = mr._reconcile_all(path, Decimal("50"), pre_snapshot, post_snapshot)
+            self.assertFalse(result["all_match"],
+                             f"Expected mismatch but got all_match=True: {result}")
+            self.assertNotEqual(result["difference_usd_nano"], 0)
+            self.assertEqual(result["users_reconciled"], 1)
+            detail = result["details"][0]
+            self.assertEqual(detail["expected_nano"], 1_000_000_000)
+            self.assertEqual(detail["actual_nano"], 999)
+            self.assertFalse(detail["match"])
+        finally:
+            os.unlink(path)
+
+    def test_21b_reconciliation_positive_counterpart(self):
+        """Exact match: _reconcile_all confirms expected == actual."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_test_db(path, users=[(12010, 5000)])
+        try:
+            pre_snapshot = {
+                "users": [{"user_id": 12010, "balance_cents": 5000}],
+                "count": 1,
+            }
+            post_snapshot = {
+                "users": [{
+                    "user_id": 12010,
+                    "balance_cents": 5000,
+                    "balance_usd_nano": 1_000_000_000,
+                    "balance_usd_nano_rate": "50",
+                    "balance_usd_nano_migrated_at": "2026-01-01",
+                }],
+                "count": 1,
+            }
+            result = mr._reconcile_all(path, Decimal("50"), pre_snapshot, post_snapshot)
+            self.assertTrue(result["all_match"])
+            self.assertEqual(result["difference_usd_nano"], 0)
         finally:
             os.unlink(path)
 
@@ -756,6 +823,283 @@ class Test26_CompleteRehearsalWorkflow(unittest.TestCase):
             self.assertTrue(report["invariants"]["all_passed"])
         finally:
             os.unlink(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ISSUE 1: Migration schema gate tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _create_db_without_column(path, users=None, omit_column=None):
+    """Create a test DB missing one specific schema component."""
+    conn = sqlite3.connect(path)
+    cols = [
+        "user_id INTEGER PRIMARY KEY",
+        "first_name TEXT NOT NULL",
+        "last_name TEXT",
+        "username TEXT",
+        "joined_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+        "points INTEGER DEFAULT 0",
+        "referred_by INTEGER",
+        "activation_status INTEGER NOT NULL DEFAULT 0",
+        "balance_cents INTEGER NOT NULL DEFAULT 0",
+        "balance_migrated_at DATETIME",
+        "is_verified INTEGER NOT NULL DEFAULT 0",
+    ]
+    if omit_column != "balance_usd_nano":
+        cols.append("balance_usd_nano INTEGER NOT NULL DEFAULT 0")
+    if omit_column != "balance_usd_nano_rate":
+        cols.append("balance_usd_nano_rate TEXT")
+    if omit_column != "balance_usd_nano_migrated_at":
+        cols.append("balance_usd_nano_migrated_at DATETIME")
+    conn.execute("CREATE TABLE IF NOT EXISTS users (" + ", ".join(cols) + ")")
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS smm_orders ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, "
+        "service_key TEXT NOT NULL, smm_order_id TEXT, link TEXT NOT NULL, "
+        "quantity INTEGER NOT NULL, points_spent INTEGER NOT NULL, "
+        "status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+        "amount_cents INTEGER)",
+        "CREATE TABLE IF NOT EXISTS withdrawal_requests ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, "
+        "points_amount INTEGER NOT NULL, status TEXT DEFAULT 'pending', "
+        "created_at DATETIME DEFAULT CURRENT_TIMESTAMP, amount_cents INTEGER, "
+        "method_code TEXT, network_code TEXT, destination TEXT, "
+        "requested_egp_cents INTEGER, usdt_micro INTEGER, "
+        "egp_equivalent_cents INTEGER, exchange_rate_micro INTEGER, "
+        "rate_fetched_at TEXT, rate_provider TEXT, fee_cents INTEGER DEFAULT 0, "
+        "refunded INTEGER DEFAULT 0, admin_id INTEGER, transaction_reference TEXT)",
+        "CREATE TABLE IF NOT EXISTS ad_reviews ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, "
+        "file_id TEXT, reward_cents INTEGER NOT NULL DEFAULT 50, "
+        "status TEXT, reviewed_at DATETIME)",
+        "CREATE TABLE IF NOT EXISTS service_price_settings ("
+        "service_key TEXT PRIMARY KEY, price_points INTEGER NOT NULL, "
+        "price_cents INTEGER, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS processed_transactions ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE, "
+        "user_id INTEGER NOT NULL, amount_cents INTEGER NOT NULL, "
+        "processed_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS referral_tasks ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, "
+        "referral_link TEXT, points_spent INTEGER NOT NULL, amount_cents INTEGER, "
+        "status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS channel_reward_ledger ("
+        "user_id INTEGER NOT NULL, task_key TEXT NOT NULL, "
+        "reward_points INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'granted', "
+        "deducted_points INTEGER NOT NULL DEFAULT 0, "
+        "granted_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+        "deducted_at DATETIME, restored_at DATETIME, "
+        "PRIMARY KEY (user_id, task_key))",
+        "CREATE TABLE IF NOT EXISTS referrals ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER NOT NULL, "
+        "referred_id INTEGER NOT NULL, rewarded_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+        "reward_status TEXT NOT NULL DEFAULT 'rewarded', reward_points INTEGER DEFAULT 1, "
+        "eligible_at DATETIME, reversed_at DATETIME, reversal_reason TEXT, "
+        "last_checked_at DATETIME)",
+        "CREATE TABLE IF NOT EXISTS promotion_packages ("
+        "package_key TEXT PRIMARY KEY, label TEXT, target_subscribers INTEGER, "
+        "points_cost INTEGER NOT NULL)",
+    ]:
+        conn.execute(ddl)
+    if omit_column != "migration_meta":
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS migration_meta ("
+            "migration_id TEXT PRIMARY KEY, version TEXT NOT NULL, "
+            "source_currency TEXT NOT NULL, target_currency TEXT NOT NULL, "
+            "egp_per_usd TEXT NOT NULL, source_unit TEXT NOT NULL, "
+            "target_unit TEXT NOT NULL, rounding_mode TEXT NOT NULL, "
+            "status TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+            "completed_at DATETIME, rows_migrated INTEGER DEFAULT 0, "
+            "rows_skipped INTEGER DEFAULT 0, total_legacy_cents INTEGER DEFAULT 0, "
+            "total_converted_nano INTEGER DEFAULT 0)"
+        )
+    if users:
+        for uid, cents in users:
+            conn.execute(
+                "INSERT INTO users (user_id, first_name, balance_cents, activation_status) "
+                "VALUES (?, 'Test', ?, 1)",
+                (uid, cents),
+            )
+    conn.execute(
+        "INSERT OR IGNORE INTO service_price_settings "
+        "(service_key, price_points, price_cents) VALUES ('test_svc', 1000, 1000)"
+    )
+    conn.commit()
+    conn.close()
+
+
+class Test27_MigrationSchemaGate(unittest.TestCase):
+    """ISSUE 1: migration_schema_status MUST block readiness."""
+
+    def test_46_complete_schema_can_be_ready(self):
+        """A: Complete schema → migration_schema_status == 'complete'."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_test_db(path, users=[(46001, 5000)])
+        try:
+            report = mr.generate_readiness_report(path, rate=Decimal("50"))
+            self.assertEqual(report["migration_schema_status"], "complete")
+            self.assertEqual(report["status"], "READY_FOR_CUTOVER_REVIEW")
+        finally:
+            os.unlink(path)
+
+    def test_47_missing_balance_usd_nano_blocks(self):
+        """B: Missing balance_usd_nano → BLOCKED."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_db_without_column(path, users=[(47001, 5000)], omit_column="balance_usd_nano")
+        try:
+            report = mr.generate_readiness_report(path, rate=Decimal("50"))
+            self.assertNotEqual(report["migration_schema_status"], "complete")
+            self.assertEqual(report["status"], "BLOCKED")
+            self.assertIn("migration_schema", report.get("blockers", []))
+        finally:
+            os.unlink(path)
+
+    def test_48_missing_balance_usd_nano_rate_blocks(self):
+        """C: Missing balance_usd_nano_rate → BLOCKED."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_db_without_column(path, users=[(48001, 5000)], omit_column="balance_usd_nano_rate")
+        try:
+            report = mr.generate_readiness_report(path, rate=Decimal("50"))
+            self.assertNotEqual(report["migration_schema_status"], "complete")
+            self.assertEqual(report["status"], "BLOCKED")
+            self.assertIn("migration_schema", report.get("blockers", []))
+        finally:
+            os.unlink(path)
+
+    def test_49_missing_balance_usd_nano_migrated_at_blocks(self):
+        """D: Missing balance_usd_nano_migrated_at → BLOCKED."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_db_without_column(path, users=[(49001, 5000)], omit_column="balance_usd_nano_migrated_at")
+        try:
+            report = mr.generate_readiness_report(path, rate=Decimal("50"))
+            self.assertNotEqual(report["migration_schema_status"], "complete")
+            self.assertEqual(report["status"], "BLOCKED")
+            self.assertIn("migration_schema", report.get("blockers", []))
+        finally:
+            os.unlink(path)
+
+    def test_50_missing_migration_meta_blocks(self):
+        """E: Missing migration_meta → BLOCKED."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_db_without_column(path, users=[(50001, 5000)], omit_column="migration_meta")
+        try:
+            report = mr.generate_readiness_report(path, rate=Decimal("50"))
+            self.assertNotEqual(report["migration_schema_status"], "complete")
+            self.assertEqual(report["status"], "BLOCKED")
+            self.assertIn("migration_schema", report.get("blockers", []))
+        finally:
+            os.unlink(path)
+
+    def test_51_multiple_missing_blocks(self):
+        """F: Multiple missing components → BLOCKED, blockers identify schema."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_db_without_column(path, users=[(51001, 5000)], omit_column="balance_usd_nano")
+        # Also drop migration_meta manually
+        conn = sqlite3.connect(path)
+        conn.execute("DROP TABLE IF EXISTS migration_meta")
+        conn.commit()
+        conn.close()
+        try:
+            report = mr.generate_readiness_report(path, rate=Decimal("50"))
+            self.assertNotEqual(report["migration_schema_status"], "complete")
+            self.assertEqual(report["status"], "BLOCKED")
+            self.assertIn("migration_schema", report.get("blockers", []))
+        finally:
+            os.unlink(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ISSUE 3: Explicit rate omission tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class Test28_RateOmissionRejection(unittest.TestCase):
+    """ISSUE 3: Omission of migration rate must be rejected."""
+
+    def test_52_preview_omits_rate(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_test_db(path, users=[(52001, 5000)])
+        try:
+            with self.assertRaises(TypeError):
+                gb.preview_legacy_migration(path)  # no rate
+        finally:
+            os.unlink(path)
+
+    def test_53_execute_omits_rate(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_test_db(path, users=[(53001, 5000)])
+        try:
+            with self.assertRaises(TypeError):
+                gb.run_legacy_migration(path)  # no rate
+        finally:
+            os.unlink(path)
+
+    def test_54_no_default_migration_rate_exists(self):
+        """No DEFAULT_MIGRATION_RATE constant exists."""
+        self.assertFalse(hasattr(gb, "DEFAULT_MIGRATION_RATE"))
+
+    def test_55_no_env_var_fallback(self):
+        """No environment variable supplies a hidden migration rate."""
+        # Verify no env var named DEFAULT_MIGRATION_RATE or similar
+        import os as _os
+        self.assertIsNone(_os.environ.get("DEFAULT_MIGRATION_RATE"))
+        self.assertIsNone(_os.environ.get("MIGRATION_RATE"))
+        self.assertIsNone(_os.environ.get("HISTORICAL_RATE"))
+
+    def test_56_omission_cannot_modify_db(self):
+        """Calling without rate must not modify the database."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_test_db(path, users=[(56001, 5000)])
+        try:
+            conn = sqlite3.connect(path)
+            before = conn.execute(
+                "SELECT balance_cents, balance_usd_nano FROM users WHERE user_id=56001"
+            ).fetchone()
+            conn.close()
+            try:
+                gb.preview_legacy_migration(path)  # no rate — should fail
+            except TypeError:
+                pass
+            conn = sqlite3.connect(path)
+            after = conn.execute(
+                "SELECT balance_cents, balance_usd_nano FROM users WHERE user_id=56001"
+            ).fetchone()
+            conn.close()
+            self.assertEqual(before, after)
+        finally:
+            os.unlink(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ISSUE 4: Loader isolation test
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class Test29_LoaderIsolation(unittest.TestCase):
+    """ISSUE 4: Loader compatibility value cannot become migration rate."""
+
+    def test_57_loader_value_not_used_as_migration_rate(self):
+        """The loader's Decimal('50') is import-compat only, not a migration rate."""
+        # Load the bot module and check its EGP_PER_USD
+        loaded = mr._load_bot_module()
+        loader_egp = getattr(loaded, "EGP_PER_USD", None)
+        # The module defines its own EGP_PER_USD from env, so it exists
+        self.assertIsNotNone(loader_egp)
+
+        # Now verify: the migration functions reject missing rate
+        # even though EGP_PER_USD exists on the module
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _create_test_db(path, users=[(57001, 5000)])
+        try:
+            with self.assertRaises(TypeError):
+                loaded.preview_legacy_migration(path)  # no rate → TypeError
+            with self.assertRaises(TypeError):
+                loaded.run_legacy_migration(path)  # no rate → TypeError
+        finally:
+            os.unlink(path)
+            # Clean up cached module
+            sys.modules.pop("ganaihat_bot", None)
 
 
 if __name__ == "__main__":
