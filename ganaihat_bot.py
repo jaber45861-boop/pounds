@@ -6259,11 +6259,12 @@ def handle_withdrawal_amount(message):
         user_state.pop(user_id, None)
         bot.send_message(message.chat.id, "يرجى إرسال /start أولاً.")
         return
-    if row_balance_cents(user) < amount_cents:
+    amount_usd_nano = egp_cents_to_wallet_nano(amount_cents)
+    if row_balance_cents(user) < amount_usd_nano:
         bot.send_message(
             message.chat.id,
             f"❌ رصيدك الحالي هو <b>{balance_text(user)}</b>، "
-            f"ولا يكفي لسحب <b>{format_balance(amount_cents)}</b>.",
+            f"ولا يكفي لسحب <b>{format_balance(amount_usd_nano)}</b>.",
         )
         return
 
@@ -7505,7 +7506,8 @@ def handle_link_input(message):
 
     row = get_user(user_id)
     price = get_service_price(service_key)
-    if row is None or row_balance_cents(row) < price:
+    price_usd_nano = egp_cents_to_wallet_nano(price)
+    if row is None or row_balance_cents(row) < price_usd_nano:
         bot.send_message(
             message.chat.id,
             service_price_message(
@@ -7553,8 +7555,9 @@ def handle_referral_link_input(message):
         return
 
     user = get_user(user_id)
-    price = get_service_price(REFERRAL_SERVICE_KEY)
-    if user is None or row_balance_cents(user) < price:
+    price_egp_cents = get_service_price(REFERRAL_SERVICE_KEY)
+    price_usd_nano = egp_cents_to_wallet_nano(price_egp_cents)
+    if user is None or row_balance_cents(user) < price_usd_nano:
         user_state.pop(user_id, None)
         bot.send_message(
             message.chat.id,
@@ -7572,7 +7575,7 @@ def handle_referral_link_input(message):
         bot.send_message(
             message.chat.id,
             f"❌ رصيدك غير كافٍ لإنشاء الطلب.\n"
-            f"تحتاج إلى <b>{format_balance(egp_cents_to_wallet_nano(price))}</b> لشراء "
+            f"تحتاج إلى <b>{format_balance(price_usd_nano)}</b> لشراء "
             f"{get_service_quantity(REFERRAL_SERVICE_KEY)} إحالة.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("💳 شراء نقاط", callback_data="buy_points"),
@@ -7641,22 +7644,24 @@ def handle_promoted_channel_input(message):
         user_state.pop(user_id, None)
         bot.send_message(message.chat.id, "يرجى إرسال /start أولاً.")
         return
-    if row_balance_cents(user) < PROMOTION_MIN_CENTS:
+    promo_min_usd_nano = egp_cents_to_wallet_nano(PROMOTION_MIN_CENTS)
+    if row_balance_cents(user) < promo_min_usd_nano:
         user_state.pop(user_id, None)
         bot.send_message(
             message.chat.id,
             "❌ الحد الأدنى للسماح بإنشاء إعلان هو "
-            f"<b>{format_balance(PROMOTION_MIN_CENTS)}</b>.\n\n"
+            f"<b>{format_balance(promo_min_usd_nano)}</b>.\n\n"
             f"رصيدك الحالي: <b>{balance_text(user)}</b>.",
             reply_markup=main_keyboard(),
         )
         return
-    if row_balance_cents(user) < package["points_cost"]:
+    package_cost_usd_nano = egp_cents_to_wallet_nano(package["points_cost"])
+    if row_balance_cents(user) < package_cost_usd_nano:
         user_state.pop(user_id, None)
         bot.send_message(
             message.chat.id,
             "❌ رصيدك غير كافٍ لتفعيل الإعلان.\n\n"
-            f"التكلفة: <b>{format_balance(package['points_cost'])}</b>\n"
+            f"التكلفة: <b>{format_balance(package_cost_usd_nano)}</b>\n"
             f"رصيدك الحالي: <b>{balance_text(user)}</b>.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 شراء نقاط", callback_data="buy_points")],
@@ -8928,10 +8933,11 @@ def callback_promote_channel(call):
         return
     if not require_active_account(call):
         return
-    if row_balance_cents(user) < PROMOTION_MIN_CENTS:
+    promo_min_usd_nano = egp_cents_to_wallet_nano(PROMOTION_MIN_CENTS)
+    if row_balance_cents(user) < promo_min_usd_nano:
         bot.answer_callback_query(
             call.id,
-            f"❌ تحتاج إلى {format_balance(PROMOTION_MIN_CENTS)} على الأقل لإنشاء إعلان.",
+            f"❌ تحتاج إلى {format_balance(promo_min_usd_nano)} على الأقل لإنشاء إعلان.",
             show_alert=True,
         )
         return
