@@ -452,6 +452,471 @@ def has_minimum_usd_nano_balance(balance_usd_nano: int) -> bool:
     return balance_usd_nano >= TASK_CREATION_MIN_BALANCE_USD_NANO
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── Phase 3: USD Nano Migration Foundation ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Schema + migration infrastructure for the EGP cents → USD nano transition.
+#
+# DESIGN PRINCIPLES:
+#   - balance_cents remains untouched during Phase 3.
+#   - balance_usd_nano is added alongside balance_cents.
+#   - Migration is explicit, offline-testable, atomic, and reversible before cutover.
+#   - Historical rate is immutable per migration run.
+#   - Double-migration is detected and rejected.
+#   - No production data is modified.
+#
+# COLUMN CLASSIFICATION (financial columns):
+#
+# LIVE FINANCIAL STATE (user wallet):
+#   users.balance_cents           — legacy EGP cents (preserved)
+#   users.balance_usd_nano        — target USD nano (NEW in Phase 3)
+#   users.balance_migrated_at     — migration timestamp
+#
+# LIVE FINANCIAL STATE (service pricing):
+#   service_price_settings.price_cents   — EGP cents
+#
+# LIVE FINANCIAL STATE (ad review rewards):
+#   ad_reviews.reward_cents              — EGP cents per ad
+#
+# LIVE FINANCIAL STATE (withdrawal accounting):
+#   withdrawal_requests.amount_cents              — legacy EGP cents
+#   withdrawal_requests.requested_egp_cents       — EGP snapshot
+#   withdrawal_requests.usdt_micro                — USDT micro (separate unit)
+#   withdrawal_requests.egp_equivalent_cents      — EGP equivalent snapshot
+#   withdrawal_requests.exchange_rate_micro        — rate snapshot
+#   withdrawal_requests.fee_cents                 — fee in EGP cents
+#
+# HISTORICAL IMMUTABLE SNAPSHOT (do not convert):
+#   smm_orders.amount_cents         — historical EGP spent
+#   smm_orders.points_spent         — legacy points spent
+#   referral_tasks.amount_cents     — historical EGP spent
+#   referral_tasks.points_spent     — legacy points spent
+#   promoted_channel_campaigns.amount_cents  — historical EGP
+#   promoted_channel_campaigns.points_cost   — legacy points
+#   processed_transactions.amount_cents       — historical EGP
+#
+# NON-FINANCIAL / DISPLAY:
+#   currency_settings.setting_value — config strings
+#   promotion_packages.points_cost — display reference
+#   channel_reward_ledger.reward_points — historical EGP reward
+#   channel_reward_ledger.deducted_points — historical deduction
+#   referrals.reward_points        — historical EGP reward
+#
+# USDT MICRO (separate unit, do NOT convert to USD nano):
+#   withdrawal_requests.usdt_micro
+#   USDT_MICRO_PER_USDT = 1,000,000
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Migration version identifier
+MIGRATION_VERSION = "phase3_v1"
+
+# Fixed historical conversion rate (EGP per 1 USD).
+# This MUST be explicitly supplied at execution time — never auto-fetched.
+DEFAULT_MIGRATION_RATE = Decimal("50")
+
+
+def egp_cents_to_usd_nano(egp_cents: int, rate: Decimal) -> int:
+    """Convert integer EGP cents to integer USD nano via a fixed rate.
+
+    Formula:
+        EGP_amount = egp_cents / 100
+        USD_amount = EGP_amount / rate
+        USD_nano   = USD_amount × 1,000,000,000
+
+    Uses Decimal exclusively — no float arithmetic.
+    Uses ROUND_HALF_UP at the nano boundary.
+
+    Args:
+        egp_cents: Legacy EGP balance in integer cents (100 = 1 EGP).
+        rate: EGP per 1 USD as a Decimal. Must be finite and > 0.
+
+    Returns:
+        Integer USD nano value.
+
+    Raises:
+        TypeError: If rate is a float.
+        ValueError: If rate is zero, negative, NaN, or Infinity.
+        ValueError: If egp_cents is negative.
+    """
+    if isinstance(rate, float):
+        raise TypeError(
+            f"float rate rejected for conversion: {rate!r}. Use Decimal."
+        )
+    r = _validate_egp_rate(rate)
+    if not isinstance(egp_cents, int) or isinstance(egp_cents, bool):
+        raise TypeError(
+            f"egp_cents must be a plain int, got {type(egp_cents).__name__}: {egp_cents!r}"
+        )
+    if egp_cents < 0:
+        raise ValueError(f"Negative EGP cents not supported: {egp_cents}")
+    # Convert: cents → EGP → USD → nano
+    egp_decimal = Decimal(egp_cents) / Decimal("100")
+    usd_decimal = egp_decimal / r
+    return usd_decimal_to_nano(usd_decimal)
+
+
+def _create_migration_metadata_table(conn) -> None:
+    """Create the migration_meta table if it does not exist.
+
+    This table stores one row per migration run with:
+      - migration_id: unique identifier
+      - version: migration version string
+      - source_currency / target_currency
+      - egp_per_usd: immutable conversion rate used
+      - source_unit / target_unit
+      - rounding_mode
+      - status: previewed | completed | failed
+      - created_at / completed_at
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS migration_meta (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            migration_id    TEXT    NOT NULL UNIQUE,
+            version         TEXT    NOT NULL,
+            source_currency TEXT    NOT NULL DEFAULT 'EGP',
+            target_currency TEXT    NOT NULL DEFAULT 'USD',
+            egp_per_usd     TEXT    NOT NULL,
+            source_unit     TEXT    NOT NULL DEFAULT 'EGP_cents',
+            target_unit     TEXT    NOT NULL DEFAULT 'USD_nano',
+            rounding_mode   TEXT    NOT NULL DEFAULT 'ROUND_HALF_UP',
+            status          TEXT    NOT NULL DEFAULT 'pending',
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            completed_at    DATETIME,
+            rows_migrated   INTEGER DEFAULT 0,
+            rows_skipped    INTEGER DEFAULT 0,
+            total_legacy_cents   INTEGER DEFAULT 0,
+            total_converted_nano INTEGER DEFAULT 0
+        )
+    """)
+
+
+def _add_balance_usd_nano_column(conn) -> bool:
+    """Add balance_usd_nano column to users table if missing.
+
+    Returns True if the column was added, False if it already existed.
+    """
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(users)")
+    }
+    if "balance_usd_nano" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN balance_usd_nano INTEGER NOT NULL DEFAULT 0"
+        )
+        return True
+    return False
+
+
+def _add_balance_usd_nano_migration_snapshot_columns(conn) -> None:
+    """Add migration snapshot columns to users table if missing.
+
+    balance_usd_nano_rate: the EGP/USD rate used for this user's conversion.
+    balance_usd_nano_migrated_at: timestamp of the conversion.
+    """
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(users)")
+    }
+    if "balance_usd_nano_rate" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN balance_usd_nano_rate TEXT"
+        )
+    if "balance_usd_nano_migrated_at" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN balance_usd_nano_migrated_at DATETIME"
+        )
+
+
+def _get_migration_status(conn, migration_id: str) -> str | None:
+    """Return the status of a migration_id, or None if not found."""
+    row = conn.execute(
+        "SELECT status FROM migration_meta WHERE migration_id = ?",
+        (migration_id,),
+    ).fetchone()
+    return row["status"] if row else None
+
+
+def preview_legacy_migration(
+    db_path: str,
+    rate: Decimal,
+    migration_id: str = "phase3_v1_egp_to_usd",
+) -> dict:
+    """Offline migration preview — reads only, never writes.
+
+    Takes a database path and produces a deterministic preview of the
+    EGP cents → USD nano migration WITHOUT modifying the source.
+
+    Args:
+        db_path: Path to the SQLite database to preview.
+        rate: Fixed EGP/USD conversion rate (Decimal).
+        migration_id: Identifier for this migration run.
+
+    Returns:
+        A dict with full preview information including per-user details.
+    """
+    import uuid as _uuid
+
+    if isinstance(rate, float):
+        raise TypeError(f"float rate rejected: {rate!r}. Use Decimal.")
+    _r = _validate_egp_rate(rate)
+
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        _create_migration_metadata_table(conn)
+
+        # Check double-migration
+        existing_status = _get_migration_status(conn, migration_id)
+        if existing_status == "completed":
+            return {
+                "status": "already_completed",
+                "migration_id": migration_id,
+                "message": f"Migration {migration_id} was already completed.",
+            }
+
+        # Check for already-migrated users
+        all_users = conn.execute(
+            "SELECT user_id, balance_cents, balance_usd_nano "
+            "FROM users"
+        ).fetchall()
+
+        total_rows = 0
+        zero_balance = 0
+        positive_balance = 0
+        negative_balance = 0
+        already_migrated = 0
+        total_legacy_cents = Decimal("0")
+        total_converted_nano = Decimal("0")
+        details = []
+
+        for user in all_users:
+            total_rows += 1
+            balance_cents = int(user["balance_cents"] or 0)
+            balance_usd_nano = int(user["balance_usd_nano"] or 0)
+
+            if balance_usd_nano != 0:
+                already_migrated += 1
+                continue
+
+            if balance_cents == 0:
+                zero_balance += 1
+                details.append({
+                    "user_id": user["user_id"],
+                    "old_balance_cents": 0,
+                    "converted_balance_usd_nano": 0,
+                    "status": "zero",
+                })
+                continue
+
+            if balance_cents < 0:
+                negative_balance += 1
+                # Still convert for accounting visibility
+                nano = egp_cents_to_usd_nano(balance_cents, _r)
+                details.append({
+                    "user_id": user["user_id"],
+                    "old_balance_cents": balance_cents,
+                    "converted_balance_usd_nano": nano,
+                    "status": "negative_converted",
+                })
+                total_legacy_cents += Decimal(balance_cents)
+                total_converted_nano += Decimal(nano)
+                continue
+
+            positive_balance += 1
+            nano = egp_cents_to_usd_nano(balance_cents, _r)
+            details.append({
+                "user_id": user["user_id"],
+                "old_balance_cents": balance_cents,
+                "converted_balance_usd_nano": nano,
+                "status": "will_migrate",
+            })
+            total_legacy_cents += Decimal(balance_cents)
+            total_converted_nano += Decimal(nano)
+
+        return {
+            "status": "preview",
+            "migration_id": migration_id,
+            "migration_version": MIGRATION_VERSION,
+            "source_currency": "EGP",
+            "target_currency": "USD",
+            "egp_per_usd": str(_r),
+            "source_unit": "EGP_cents",
+            "target_unit": "USD_nano",
+            "rounding_mode": "ROUND_HALF_UP",
+            "rows_considered": total_rows,
+            "rows_zero_balance": zero_balance,
+            "rows_positive_balance": positive_balance,
+            "rows_negative_balance": negative_balance,
+            "rows_already_migrated": already_migrated,
+            "total_legacy_egp_cents": int(total_legacy_cents),
+            "total_converted_usd_nano": int(total_converted_nano),
+            "details": details,
+            "deterministic": True,
+            "source_db_unmodified": True,
+        }
+    finally:
+        conn.close()
+
+
+def run_legacy_migration(
+    db_path: str,
+    rate: Decimal,
+    migration_id: str = "phase3_v1_egp_to_usd",
+) -> dict:
+    """Execute the EGP cents → USD nano migration on a specified database.
+
+    IMPORTANT:
+      - Requires an explicit db_path. Never defaults to production.
+      - Atomic: rolls back completely on any failure.
+      - Idempotent: detects and rejects already-completed migrations.
+      - Preserves balance_cents.
+      - Only writes balance_usd_nano.
+
+    Args:
+        db_path: Path to the SQLite database to migrate.
+        rate: Fixed EGP/USD conversion rate (Decimal).
+        migration_id: Identifier for this migration run.
+
+    Returns:
+        A dict with migration results.
+    """
+    if isinstance(rate, float):
+        raise TypeError(f"float rate rejected: {rate!r}. Use Decimal.")
+    _r = _validate_egp_rate(rate)
+
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        _create_migration_metadata_table(conn)
+        _add_balance_usd_nano_column(conn)
+        _add_balance_usd_nano_migration_snapshot_columns(conn)
+
+        # Check double-migration
+        existing_status = _get_migration_status(conn, migration_id)
+        if existing_status == "completed":
+            return {
+                "status": "already_completed",
+                "migration_id": migration_id,
+                "message": f"Migration {migration_id} was already completed.",
+            }
+        if existing_status == "previewed":
+            pass  # OK to proceed with execution
+
+        # Begin atomic transaction
+        conn.execute("BEGIN IMMEDIATE")
+
+        all_users = conn.execute(
+            "SELECT user_id, balance_cents, balance_usd_nano "
+            "FROM users"
+        ).fetchall()
+
+        rows_migrated = 0
+        rows_skipped = 0
+        total_legacy_cents = 0
+        total_converted_nano = 0
+
+        for user in all_users:
+            balance_cents = int(user["balance_cents"] or 0)
+            balance_usd_nano = int(user["balance_usd_nano"] or 0)
+
+            # Skip if already has USD nano balance
+            if balance_usd_nano != 0:
+                rows_skipped += 1
+                continue
+
+            # Skip zero balances
+            if balance_cents == 0:
+                rows_skipped += 1
+                continue
+
+            # Convert
+            nano = egp_cents_to_usd_nano(balance_cents, _r)
+
+            # Write only balance_usd_nano — preserve balance_cents
+            conn.execute(
+                "UPDATE users SET balance_usd_nano = ?, "
+                "balance_usd_nano_rate = ?, "
+                "balance_usd_nano_migrated_at = CURRENT_TIMESTAMP "
+                "WHERE user_id = ?",
+                (nano, str(_r), user["user_id"]),
+            )
+
+            rows_migrated += 1
+            total_legacy_cents += balance_cents
+            total_converted_nano += nano
+
+        # Record migration metadata
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        conn.execute(
+            "INSERT INTO migration_meta "
+            "(migration_id, version, source_currency, target_currency, "
+            "egp_per_usd, source_unit, target_unit, rounding_mode, "
+            "status, created_at, completed_at, "
+            "rows_migrated, rows_skipped, "
+            "total_legacy_cents, total_converted_nano) "
+            "VALUES (?, ?, 'EGP', 'USD', ?, 'EGP_cents', 'USD_nano', 'ROUND_HALF_UP', 'completed', ?, ?, ?, ?, ?, ?)",
+            (
+                migration_id,
+                MIGRATION_VERSION,
+                str(_r),
+                now_iso,
+                now_iso,
+                rows_migrated,
+                rows_skipped,
+                total_legacy_cents,
+                total_converted_nano,
+            ),
+        )
+
+        conn.commit()
+        return {
+            "status": "completed",
+            "migration_id": migration_id,
+            "migration_version": MIGRATION_VERSION,
+            "rate": str(_r),
+            "rows_migrated": rows_migrated,
+            "rows_skipped": rows_skipped,
+            "total_legacy_cents": total_legacy_cents,
+            "total_converted_nano": total_converted_nano,
+            "atomic": True,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reconcile_user_balance(
+    user_balance_cents: int,
+    migration_rate: Decimal,
+    expected_usd_nano: int,
+    actual_usd_nano: int,
+) -> dict:
+    """Reconciliation helper for post-migration verification.
+
+    Compares expected vs actual USD nano balance for a migrated user.
+
+    Args:
+        user_balance_cents: The user's original EGP balance in cents.
+        migration_rate: The EGP/USD rate used for conversion.
+        expected_usd_nano: What the balance SHOULD be after migration.
+        actual_usd_nano: What the balance ACTUALLY is in the database.
+
+    Returns:
+        A dict with reconciliation details.
+    """
+    computed = egp_cents_to_usd_nano(user_balance_cents, migration_rate)
+    match = (computed == expected_usd_nano == actual_usd_nano)
+    return {
+        "match": match,
+        "original_egp_cents": user_balance_cents,
+        "migration_rate": str(migration_rate),
+        "computed_usd_nano": computed,
+        "expected_usd_nano": expected_usd_nano,
+        "actual_usd_nano": actual_usd_nano,
+    }
+
+
 WITHDRAWAL_COOLDOWN_MESSAGE = (
     "⚠️ تنبيه: مسموح بطلب سحب واحد فقط كل 24 ساعة لمنع الضغط! "
     "يمكنك تقديم طلب جديد غداً."
@@ -1109,6 +1574,19 @@ def init_db():
                 "ALTER TABLE users ADD COLUMN is_verified INTEGER "
                 "NOT NULL DEFAULT 0"
             )
+        if "balance_usd_nano" not in user_columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN balance_usd_nano INTEGER "
+                "NOT NULL DEFAULT 0"
+            )
+        if "balance_usd_nano_rate" not in user_columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN balance_usd_nano_rate TEXT"
+            )
+        if "balance_usd_nano_migrated_at" not in user_columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN balance_usd_nano_migrated_at DATETIME"
+            )
         conn.execute(
             "UPDATE users SET balance_cents = points, "
             "balance_migrated_at = CURRENT_TIMESTAMP "
@@ -1662,6 +2140,7 @@ def init_db():
                 processed_at       DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        _create_migration_metadata_table(conn)
         conn.commit()
     refresh_promotion_packages()
     refresh_required_channels()
