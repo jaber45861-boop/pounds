@@ -28,6 +28,22 @@ from flask import Flask, jsonify, request
 
 logger = logging.getLogger("telegram_reward_api")
 
+# Shared EGP/USD reference rate for live accounting conversions.
+EGP_PER_USD_REF = Decimal("50")
+
+
+def _egp_cents_to_nano(egp_cents: int) -> int:
+    """Convert EGP cents to USD nano for live wallet accounting.
+
+    Formula: EGP_cents / 100 / EGP_PER_USD * 1_000_000_000
+           = EGP_cents * 10_000_000 / EGP_PER_USD
+    Uses Decimal exclusively. Returns integer USD nano.
+    """
+    return int(
+        (Decimal(int(egp_cents)) * Decimal("10000000") / EGP_PER_USD_REF)
+        .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ─── Provider-Agnostic Conversion Engine ─────────────────────────────────────
@@ -109,9 +125,12 @@ def _process_conversion(
     if conv.status != "approved":
         return {"status": "skipped", "message": f"conversion_{conv.status}"}
 
-    # Calculate splits
+    # Calculate splits — all amounts are EGP cents at this point
     user_cents = int(conv.amount_cents * user_profit_pct)
     commission_cents = conv.amount_cents - user_cents
+
+    # Convert EGP cents → USD nano for live wallet accounting
+    user_nano = _egp_cents_to_nano(user_cents)
     idempotency_key = f"{conv.provider}:{conv.transaction_id}"
 
     conn = get_connection()
@@ -148,19 +167,20 @@ def _process_conversion(
         )
         cursor.execute(
             "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
-            (user_cents, conv.user_id),
+            (user_nano, conv.user_id),
         )
 
     logger.info(
-        "payment/callback: user %s credited %d cents (%.0f%% of %d). "
+        "payment/callback: user %s credited %d cents -> %d nano (%.0f%% of %d). "
         "Commission: %d. Key: %s",
-        conv.user_id, user_cents, user_profit_pct * 100, conv.amount_cents,
+        conv.user_id, user_cents, user_nano, user_profit_pct * 100, conv.amount_cents,
         commission_cents, idempotency_key,
     )
     return {
         "status": "success",
         "user_id": conv.user_id,
-        "credited_cents": user_cents,
+        "credited_nano": user_nano,
+        "credited_cents_source": user_cents,
         "commission_cents": commission_cents,
         "applied_user_ratio": f"{user_profit_pct * 100}%",
     }
@@ -291,16 +311,18 @@ def register_reward_api(
                 "VALUES (?, ?, ?, 'approved', CURRENT_TIMESTAMP)",
                 (uid, ymid, reward),
             )
+            # Convert EGP cents → USD nano for live wallet accounting
+            reward_nano = _egp_cents_to_nano(reward)
             conn.execute(
                 "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
-                (reward, uid),
+                (reward_nano, uid),
             )
             conn.commit()
         except sqlite3.Error as exc:
             logger.error("postback DB error: %s", exc)
             return jsonify({"error": "db_error"}), 500
 
-        return jsonify({"ok": True, "reward_cents": reward})
+        return jsonify({"ok": True, "reward_nano": reward_nano, "reward_cents_source": reward})
 
     # ─── Provider-agnostic payment callback ──────────────────────────────────
 
@@ -431,7 +453,7 @@ def register_reward_api(
                 "min_quantity": svc.get("min"),
                 "max_quantity": svc.get("max"),
                 "rate_per_1k_usd": float(rate_usd_decimal),
-                "sell_price_cents": sell_price_cents,
+                "sell_price_usd_nano": sell_price_nano,
                 "sell_price_egp": float(sell_price_egp.quantize(
                     Decimal("0.01"), rounding=ROUND_HALF_UP
                 )),
