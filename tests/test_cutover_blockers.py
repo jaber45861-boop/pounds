@@ -50,6 +50,11 @@ from reward_api import _egp_cents_to_nano, _live_egp_per_usd
 class TestEgpCentsToNanoConversion(unittest.TestCase):
     """Prove the _egp_cents_to_nano helper converts correctly."""
 
+    @classmethod
+    def setUpClass(cls):
+        import reward_api
+        reward_api._live_egp_per_usd = Decimal("50")
+
     def test_01_50_egp_cents_to_nano(self):
         """50 EGP cents = 0.50 EGP = $0.01 = 10,000,000 nano."""
         result = _egp_cents_to_nano(50)
@@ -73,6 +78,7 @@ class TestEgpCentsToNanoConversion(unittest.TestCase):
     def test_04b_rate_is_configurable(self):
         """_live_egp_per_usd must be configurable at runtime."""
         import reward_api
+        self.assertIsNotNone(reward_api._live_egp_per_usd)
         self.assertIsInstance(reward_api._live_egp_per_usd, Decimal)
         self.assertGreater(reward_api._live_egp_per_usd, 0)
 
@@ -120,6 +126,8 @@ class TestProcessConversionCreditsNano(unittest.TestCase):
         os.unlink(cls.DB_PATH)
 
     def setUp(self):
+        import reward_api
+        reward_api._live_egp_per_usd = Decimal("50")
         with gb.get_connection() as conn:
             conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("DELETE FROM users")
@@ -295,6 +303,8 @@ class TestBalanceCentsUnchanged(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        import reward_api
+        reward_api._live_egp_per_usd = Decimal("50")
         cls._db_fd, cls.DB_PATH = tempfile.mkstemp(suffix=".db")
         os.environ["BOT_DB_PATH"] = cls.DB_PATH
         gb.init_db()
@@ -363,6 +373,11 @@ class TestBalanceCentsUnchanged(unittest.TestCase):
 class TestExactNanoBoundary(unittest.TestCase):
     """Prove exact numeric conversion at the critical boundary."""
 
+    @classmethod
+    def setUpClass(cls):
+        import reward_api
+        reward_api._live_egp_per_usd = Decimal("50")
+
     def test_01_50_egp_cents_exact_boundary(self):
         """50 EGP cents at 50 EGP/USD = exactly 10,000,000 nano."""
         self.assertEqual(_egp_cents_to_nano(50), 10_000_000)
@@ -380,8 +395,9 @@ class TestExactNanoBoundary(unittest.TestCase):
         self.assertEqual(_egp_cents_to_nano(10000), 2_000_000_000)
 
     def test_04_conversion_uses_stored_rate(self):
-        """The helper uses _live_egp_per_usd (default = 50)."""
+        """The helper uses _live_egp_per_usd after initialization."""
         import reward_api
+        self.assertIsNotNone(reward_api._live_egp_per_usd)
         self.assertEqual(reward_api._live_egp_per_usd, Decimal("50"))
 
     def test_05_helper_returns_integer(self):

@@ -4059,11 +4059,15 @@ def create_withdrawal_request(
     withdrawal_method: str,
     account_details: str,
 ) -> int | str | None:
-    """Legacy create path. Customer flow is locked to V2.
+    """LEGACY — DISABLED. All callers must use create_v2_withdrawal_request().
 
-    Refuses non-admin callers to prevent bypass. Kept for admin use only
-    and for backwards compatibility with existing rows / admin tooling.
+    This function contained a raw EGP-cents-to-USD-nano debit path that
+    could corrupt wallet accounting. It is now unconditionally disabled.
+    Customer and admin flows must use the V2 withdrawal path.
     """
+    return "legacy_disabled"
+
+    # DEAD CODE BELOW — retained for reference only, never executed.
     if not is_admin(user_id):
         return "customer_legacy_disabled"
     """يخصم النقاط وينشئ الطلب مع تطبيق حد طلب واحد كل 24 ساعة."""
@@ -9938,20 +9942,13 @@ def callback_buy_service(call):
 
     svc = SERVICE_INDEX[service_key]
 
-    price = get_service_price(service_key)
-    if row_balance_cents(row) < price:
+    price_egp_cents = get_service_price(service_key)
+    price_usd_nano = egp_cents_to_wallet_nano(price_egp_cents)
+    balance_nano = row_balance_cents(row)
+    if balance_nano < price_usd_nano:
         bot.answer_callback_query(
             call.id,
-            service_price_message(service_key, row_balance_cents(row)),
-            show_alert=True,
-        )
-        return
-
-    # Task creation eligibility gate: wallet >= $0.01 USD nano
-    if not has_minimum_usd_nano_balance(row_balance_cents(row)):
-        bot.answer_callback_query(
-            call.id,
-            "⚠️ رصيدك لا يفي بشروط إنشاء المهام.\nالحد الأدنى: $0.01",
+            service_price_message(service_key, balance_nano),
             show_alert=True,
         )
         return
@@ -10005,13 +10002,15 @@ def callback_confirm_order(call):
         return
 
     latest_user = get_user(user_id)
-    price = get_service_price(service_key)
-    if latest_user is None or row_balance_cents(latest_user) < price:
+    price_egp_cents = get_service_price(service_key)
+    price_usd_nano = egp_cents_to_wallet_nano(price_egp_cents)
+    latest_balance_nano = row_balance_cents(latest_user) if latest_user else 0
+    if latest_user is None or latest_balance_nano < price_usd_nano:
         bot.answer_callback_query(
             call.id,
             service_price_message(
                 service_key,
-                row_balance_cents(latest_user) if latest_user else 0,
+                latest_balance_nano,
             ),
             show_alert=True,
         )
@@ -10058,21 +10057,33 @@ def callback_confirm_order(call):
     link = state["link"]
 
     latest_user = get_user(user_id)
-    price = get_service_price(service_key)
-    if latest_user is None or row_balance_cents(latest_user) < price:
+    price_egp_cents = get_service_price(service_key)
+    price_usd_nano = egp_cents_to_wallet_nano(price_egp_cents)
+    latest_balance_nano = row_balance_cents(latest_user) if latest_user else 0
+    if latest_user is None or latest_balance_nano < price_usd_nano:
         bot.answer_callback_query(
             call.id,
             service_price_message(
                 service_key,
-                row_balance_cents(latest_user) if latest_user else 0,
+                latest_balance_nano,
             ),
             show_alert=True,
         )
         user_state.pop(user_id, None)
         return
 
+    # Task creation eligibility gate: wallet >= $0.01 USD nano (correct placement)
+    if not has_minimum_usd_nano_balance(latest_balance_nano):
+        bot.answer_callback_query(
+            call.id,
+            "Task creation requires minimum $0.01 wallet balance.",
+            show_alert=True,
+        )
+        user_state.pop(user_id, None)
+        return
+
     # ─── خصم النقاط ذرياً ────────────────────────────────────────────────
-    success = deduct_points(user_id, price)
+    success = deduct_points(user_id, price_egp_cents)
     if not success:
         bot.answer_callback_query(
             call.id, "❌ نقاطك غير كافية!", show_alert=True,

@@ -30,7 +30,7 @@ logger = logging.getLogger("telegram_reward_api")
 
 # Live EGP/USD rate — set from register_reward_api() parameter.
 # NOT a migration rate. Used for live EGP-cent → USD-nano conversions.
-_live_egp_per_usd: Decimal = Decimal("50")
+_live_egp_per_usd: Decimal | None = None
 
 
 def _egp_cents_to_nano(egp_cents: int) -> int:
@@ -39,7 +39,13 @@ def _egp_cents_to_nano(egp_cents: int) -> int:
     Uses the live EGP/USD rate configured at registration time.
     Formula: EGP_cents * 10_000_000 / EGP_PER_USD
     Uses Decimal exclusively. Returns integer USD nano.
+    Raises RuntimeError if live FX rate not yet initialized.
     """
+    if _live_egp_per_usd is None:
+        raise RuntimeError(
+            "Live FX rate not initialized. "
+            "Call register_reward_api(egp_per_usd=...) before using conversions."
+        )
     return int(
         (Decimal(int(egp_cents)) * Decimal("10000000") / _live_egp_per_usd)
         .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
@@ -212,7 +218,10 @@ def register_reward_api(
 ):
     """Register Flask routes for the Mini App reward API."""
     global _live_egp_per_usd
-    _live_egp_per_usd = Decimal(str(egp_per_usd))
+    _rate = Decimal(str(egp_per_usd))
+    if not _rate.is_finite() or _rate <= 0:
+        raise ValueError(f"egp_per_usd must be a finite positive number, got {egp_per_usd!r}")
+    _live_egp_per_usd = _rate
 
     # Normalize SMMCPAN URL once at startup
     _raw = smmcpan_api_url.rstrip("/")

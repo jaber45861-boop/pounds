@@ -654,7 +654,7 @@ class TestV2CustomerRouting(unittest.TestCase):
             account_details="01012345678",
         )
         # Must refuse — non-admin caller must not create a row.
-        self.assertEqual(result, "customer_legacy_disabled")
+        self.assertEqual(result, "legacy_disabled")
 
     def test_62_legacy_create_does_not_insert_row(self):
         # Ensure no row was created in DB
