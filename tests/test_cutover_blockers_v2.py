@@ -389,7 +389,9 @@ class TestLiveFXInitialization(unittest.TestCase):
         self.assertEqual(gb.EGP_PER_USD, Decimal("50"))
         reward_api._live_egp_per_usd = Decimal("25")
         bot_result = gb.egp_cents_to_wallet_nano(50)
-        self.assertEqual(bot_result, 10_000_000, "Bot uses its own EGP_PER_USD")
+        # BLOCKER A: bot now uses live FX, not static EGP_PER_USD
+        # 50 EGP cents at live rate 25 = 2.00 USD = 20,000,000 nano
+        self.assertEqual(bot_result, 20_000_000, "Bot uses live FX rate")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -29,6 +29,9 @@ sys.modules["ganaihat_bot"] = _mod
 
 gb = _mod
 
+import reward_api as _reward_api
+_reward_api._live_egp_per_usd = Decimal("50")
+
 
 class TestV2Constants(unittest.TestCase):
     def test_01_vodafone_minimum_usd(self):
@@ -210,6 +213,7 @@ class TestV2WithdrawalCreation(unittest.TestCase):
         os.unlink(cls.DB_PATH)
 
     def setUp(self):
+        _reward_api._live_egp_per_usd = Decimal("50")
         # Seed a user with sufficient balance
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
@@ -486,6 +490,7 @@ class TestV2AdminFlow(unittest.TestCase):
         os.unlink(cls.DB_PATH)
 
     def setUp(self):
+        _reward_api._live_egp_per_usd = Decimal("50")
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute("DELETE FROM users WHERE user_id = 888")
@@ -740,6 +745,7 @@ class TestVodafoneEnforcementAtRate(unittest.TestCase):
         os.unlink(cls.DB_PATH)
 
     def setUp(self):
+        _reward_api._live_egp_per_usd = Decimal("50")
         with gb.get_connection() as conn:
             conn.execute("DELETE FROM withdrawal_requests")
             conn.execute("DELETE FROM users WHERE user_id = 555")
@@ -854,6 +860,9 @@ class TestWithdrawalEntryGate(unittest.TestCase):
     This blocked customers from reaching the V2 method selector even when
     they qualified for Vodafone's lower dynamic minimum ($0.10).
     """
+
+    def setUp(self):
+        _reward_api._live_egp_per_usd = Decimal("50")
 
     def test_70_no_generic_min_withdrawal_gate_in_source(self):
         """Verify the source code of callback_withdraw_earnings does NOT

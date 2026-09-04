@@ -2,6 +2,8 @@ import os
 from flask import Flask, jsonify
 from threading import Thread
 import logging
+
+logger = logging.getLogger("ganaihat_bot")
 from waitress import serve
 
 app = Flask(__name__)
@@ -463,12 +465,21 @@ PROMOTED_CHANNEL_REWARD_USD_NANO = 10_000_000  # $0.01 exactly
 def egp_cents_to_wallet_nano(egp_cents: int) -> int:
     """Convert EGP cents to USD nano for live wallet accounting.
 
-    Formula: EGP_cents / 100 / EGP_PER_USD * 1_000_000_000
-           = EGP_cents * 10_000_000 / EGP_PER_USD
+    Uses the live FX rate initialized by register_reward_api().
+    Formula: EGP_cents * 10_000_000 / live_egp_per_usd
     Uses Decimal exclusively. Returns integer USD nano.
+
+    Raises RuntimeError if live FX rate has not been initialized.
     """
+    from reward_api import _live_egp_per_usd as _live_rate
+    rate = _live_rate
+    if rate is None:
+        raise RuntimeError(
+            "Live FX rate not initialized. "
+            "Call register_reward_api(egp_per_usd=...) before wallet conversions."
+        )
     return int(
-        (Decimal(int(egp_cents)) * Decimal("10000000") / EGP_PER_USD)
+        (Decimal(int(egp_cents)) * Decimal("10000000") / rate)
         .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     )
 
@@ -2127,6 +2138,7 @@ def init_db():
             "ALTER TABLE withdrawal_requests ADD COLUMN refunded INTEGER DEFAULT 0",
             "ALTER TABLE withdrawal_requests ADD COLUMN admin_id INTEGER",
             "ALTER TABLE withdrawal_requests ADD COLUMN transaction_reference TEXT",
+            "ALTER TABLE withdrawal_requests ADD COLUMN debit_usd_nano INTEGER",
         ]:
             col_name = col_sql.split("ADD COLUMN ")[1].split(" ")[0]
             if col_name not in withdrawal_columns:
@@ -4169,7 +4181,7 @@ def cancel_withdrawal_and_refund(request_id: int):
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT user_id, points_amount, amount_cents FROM withdrawal_requests "
+            "SELECT user_id, points_amount, amount_cents, debit_usd_nano FROM withdrawal_requests "
             "WHERE id = ? AND status = 'pending'",
             (request_id,),
         ).fetchone()
@@ -4180,9 +4192,21 @@ def cancel_withdrawal_and_refund(request_id: int):
             "UPDATE withdrawal_requests SET status = 'cancelled' WHERE id = ?",
             (request_id,),
         )
+        # Use stored debit_usd_nano if available; otherwise fail safely
+        # for legacy rows that predate the debit snapshot field.
+        refund_nano = row["debit_usd_nano"]
+        if refund_nano is None:
+            # Legacy row: cannot safely recalculate with current FX.
+            # Do not corrupt balances — fail the cancel safely.
+            conn.rollback()
+            return False
+        refund_nano = int(refund_nano)
+        if refund_nano <= 0:
+            conn.rollback()
+            return False
         conn.execute(
             "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
-            (egp_cents_to_wallet_nano(row["amount_cents"] or row["points_amount"]), row["user_id"]),
+            (refund_nano, row["user_id"]),
         )
         return True
 
@@ -4576,8 +4600,8 @@ def create_v2_withdrawal_request(
             "account_details, method_code, network_code, destination, "
             "requested_egp_cents, usdt_micro, egp_equivalent_cents, "
             "exchange_rate_micro, rate_fetched_at, rate_provider, "
-            "fee_cents, refunded, status"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            "fee_cents, refunded, status, debit_usd_nano"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
             (
                 user_id,
                 amount_cents,
@@ -4595,6 +4619,7 @@ def create_v2_withdrawal_request(
                 rate_provider,
                 0,
                 0,
+                debit_nano,  # exact USD nano debited at creation-time FX
             ),
         )
         new_id = int(cursor.lastrowid)
@@ -4671,11 +4696,26 @@ def reject_v2_withdrawal(request_id: int, admin_id: int,
         if row["method_code"] not in (WITHDRAWAL_METHOD_VODAFONE, WITHDRAWAL_METHOD_USDT):
             conn.rollback()
             return None
-        # Atomic refund
-        amount = int(row["amount_cents"] or row["points_amount"] or 0)
+        # Atomic refund — use the EXACT stored debit_usd_nano from creation time.
+        # Do NOT recalculate via egp_cents_to_wallet_nano() which uses current FX.
+        stored_debit = row["debit_usd_nano"]
+        if stored_debit is None:
+            # Legacy V2 row without debit snapshot: fail safely, do not corrupt
+            # balances by recalculating with current FX rate.
+            logger.warning(
+                "reject_v2_withdrawal: request %d has no stored debit_usd_nano. "
+                "Cannot safely refund. Requires manual admin review.",
+                request_id,
+            )
+            conn.rollback()
+            return None
+        stored_debit = int(stored_debit)
+        if stored_debit <= 0:
+            conn.rollback()
+            return None
         conn.execute(
             "UPDATE users SET balance_usd_nano = balance_usd_nano + ? WHERE user_id = ?",
-            (egp_cents_to_wallet_nano(amount), row["user_id"]),
+            (stored_debit, row["user_id"]),
         )
         conn.execute(
             "UPDATE withdrawal_requests SET "

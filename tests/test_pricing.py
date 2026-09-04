@@ -28,6 +28,10 @@ _mod.EGP_PER_USD = _decimal.Decimal("50")
 _spec.loader.exec_module(_mod)
 _sys.modules["ganaihat_bot"] = _mod
 
+import reward_api as _reward_api
+_reward_api._live_egp_per_usd = Decimal("50")
+
+
 calculate_selling_price = _mod.calculate_selling_price
 MARGIN_MULTIPLIER = _mod.MARGIN_MULTIPLIER
 parse_currency_input = _mod.parse_currency_input
@@ -50,6 +54,9 @@ class TestPricingMargin(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         os.unlink(cls.DB_PATH)
+
+    def setUp(self):
+        _reward_api._live_egp_per_usd = Decimal("50")
 
     def test_margin_constant(self):
         self.assertEqual(MARGIN_MULTIPLIER, Decimal("1.30"))
