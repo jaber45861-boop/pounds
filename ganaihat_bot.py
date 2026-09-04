@@ -10072,16 +10072,6 @@ def callback_confirm_order(call):
         user_state.pop(user_id, None)
         return
 
-    # Task creation eligibility gate: wallet >= $0.01 USD nano (correct placement)
-    if not has_minimum_usd_nano_balance(latest_balance_nano):
-        bot.answer_callback_query(
-            call.id,
-            "Task creation requires minimum $0.01 wallet balance.",
-            show_alert=True,
-        )
-        user_state.pop(user_id, None)
-        return
-
     # ─── خصم النقاط ذرياً ────────────────────────────────────────────────
     success = deduct_points(user_id, price_egp_cents)
     if not success:
@@ -10104,7 +10094,7 @@ def callback_confirm_order(call):
 
     if result["success"]:
         order_id = result["order_id"]
-        save_order(user_id, service_key, order_id, link, quantity, price)
+        save_order(user_id, service_key, order_id, link, quantity, price_egp_cents)
         user_state.pop(user_id, None)
         updated = get_user(user_id)
 
@@ -10127,13 +10117,13 @@ def callback_confirm_order(call):
 
     else:
         # فشل السيرفر → أعِد النقاط للمستخدم
-        add_points(user_id, price)
+        add_points(user_id, price_egp_cents)
         user_state.pop(user_id, None)
 
         bot.edit_message_text(
             f"❌ <b>فشل الطلب — تم استرداد نقاطك</b>\n\n"
             f"الخطأ: {result['error']}\n\n"
-            f"تم إرجاع <b>{format_balance(egp_cents_to_wallet_nano(price))}</b> إلى رصيدك.",
+            f"تم إرجاع <b>{format_balance(price_usd_nano)}</b> إلى رصيدك.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=InlineKeyboardMarkup([
