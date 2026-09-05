@@ -1685,19 +1685,6 @@ def init_db():
                 "ALTER TABLE users ADD COLUMN is_verified INTEGER "
                 "NOT NULL DEFAULT 0"
             )
-        if "balance_usd_nano" not in user_columns:
-            conn.execute(
-                "ALTER TABLE users ADD COLUMN balance_usd_nano INTEGER "
-                "NOT NULL DEFAULT 0"
-            )
-        if "balance_usd_nano_rate" not in user_columns:
-            conn.execute(
-                "ALTER TABLE users ADD COLUMN balance_usd_nano_rate TEXT"
-            )
-        if "balance_usd_nano_migrated_at" not in user_columns:
-            conn.execute(
-                "ALTER TABLE users ADD COLUMN balance_usd_nano_migrated_at DATETIME"
-            )
         conn.execute(
             "UPDATE users SET balance_cents = points, "
             "balance_migrated_at = CURRENT_TIMESTAMP "
@@ -2252,7 +2239,6 @@ def init_db():
                 processed_at       DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        _create_migration_metadata_table(conn)
         conn.commit()
     refresh_promotion_packages()
     refresh_required_channels()

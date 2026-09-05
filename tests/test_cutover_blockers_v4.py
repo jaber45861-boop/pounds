@@ -142,6 +142,12 @@ class _WBase(unittest.TestCase):
         os.environ["BOT_DB_PATH"] = cls._db
         gb.DB_PATH = cls._db
         gb.init_db()
+        # Financial migration columns are no longer created by init_db().
+        # Tests exercising V2 withdrawal / wallet logic need them.
+        with gb.get_connection() as c:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
+            if "balance_usd_nano" not in cols:
+                c.execute("ALTER TABLE users ADD COLUMN balance_usd_nano INTEGER NOT NULL DEFAULT 0")
         _set_fx("50")
         # Seed USDT/EGP rate so create_v2_withdrawal_request works
         with gb.get_connection() as c:

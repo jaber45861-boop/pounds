@@ -119,6 +119,9 @@ class TestSchemaPhase3(unittest.TestCase):
         cls._db_fd, cls.DB_PATH = tempfile.mkstemp(suffix=".db")
         os.environ["BOT_DB_PATH"] = cls.DB_PATH
         gb.init_db()
+        # Financial schema is now owned by the explicit migration path.
+        # Run it so schema-phase3 tests can verify the complete schema.
+        run_legacy_migration(gb.DB_PATH, Decimal("50"), "test_schema_phase3")
 
     @classmethod
     def tearDownClass(cls):
