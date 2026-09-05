@@ -1748,14 +1748,6 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_referrals_referrer "
             "ON referrals(referrer_id)"
         )
-        # مكافآت الإحالة المعلقة لم تعد تنتظر 24 ساعة؛ قيمتها التشغيلية
-        # الحالية هي 0.50 جنيه، وتُصرف عند فتح الحساب المحال فقط.
-        conn.execute(
-            "UPDATE referrals SET reward_points = ? "
-            "WHERE reward_status = 'pending'",
-            (REFERRAL_REWARD_USD_NANO,),
-        )
-        # إزالة الحظر القديم الذي سببه فحص احتجاز الإحالات فقط.
         conn.execute(
             "UPDATE users SET withdrawal_blocked = 0, "
             "fraud_reason = NULL, fraud_marked_at = NULL "
