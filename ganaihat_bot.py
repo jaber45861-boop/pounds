@@ -1705,11 +1705,6 @@ def init_db():
                 "ALTER TABLE users ADD COLUMN is_verified INTEGER "
                 "NOT NULL DEFAULT 0"
             )
-        conn.execute(
-            "UPDATE users SET balance_cents = points, "
-            "balance_migrated_at = CURRENT_TIMESTAMP "
-            "WHERE balance_migrated_at IS NULL"
-        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS referrals (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,

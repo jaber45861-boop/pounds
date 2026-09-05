@@ -207,6 +207,40 @@ class TestInitDbNoFinancialSchema(unittest.TestCase):
         finally:
             gb.get_connection = original_get_connection
 
+    def test_init_db_does_not_backfill_balance_cents(self):
+        """TEST: init_db() must NOT copy points into balance_cents."""
+        def _test_conn():
+            c = sqlite3.connect(self._db_path)
+            c.row_factory = sqlite3.Row
+            return c
+
+        # Create a legacy user with points=500 but balance_cents=0
+        conn = sqlite3.connect(self._db_path)
+        conn.execute(
+            "INSERT INTO users (user_id, first_name, points) VALUES (100, 'Legacy', 500)"
+        )
+        conn.commit()
+        conn.close()
+
+        original_get_connection = gb.get_connection
+        gb.get_connection = _test_conn
+        try:
+            init_db()
+            conn = sqlite3.connect(self._db_path)
+            user = conn.execute(
+                "SELECT points, balance_cents, balance_migrated_at "
+                "FROM users WHERE user_id = 100"
+            ).fetchone()
+            # balance_cents must remain 0 (not copied from points)
+            self.assertEqual(user[1], 0,
+                "init_db() must NOT copy points into balance_cents")
+            # balance_migrated_at must remain NULL
+            self.assertIsNone(user[2],
+                "init_db() must NOT set balance_migrated_at")
+            conn.close()
+        finally:
+            gb.get_connection = original_get_connection
+
 
 class TestExplicitMigrationStillWorks(unittest.TestCase):
     """TEST C: Verify explicit migration path creates financial schema."""
