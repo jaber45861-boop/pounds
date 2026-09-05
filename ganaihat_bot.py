@@ -704,6 +704,22 @@ def _add_balance_usd_nano_migration_snapshot_columns(conn) -> None:
         )
 
 
+def backfill_balance_cents_from_points(conn) -> int:
+    """Copy legacy points into balance_cents for un-migrated users.
+
+    This bridges the old points-based accounting to the balance_cents column.
+    Idempotent: rows with balance_migrated_at already populated are skipped.
+
+    Returns the number of rows updated.
+    """
+    cur = conn.execute(
+        "UPDATE users SET balance_cents = points, "
+        "balance_migrated_at = CURRENT_TIMESTAMP "
+        "WHERE balance_migrated_at IS NULL"
+    )
+    return cur.rowcount
+
+
 def _get_migration_status(conn, migration_id: str) -> str | None:
     """Return the status of a migration_id, or None if not found."""
     row = conn.execute(
