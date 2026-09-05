@@ -2063,10 +2063,6 @@ def init_db():
                 "ALTER TABLE ad_reviews ADD COLUMN ad_link_id INTEGER"
             )
         conn.execute(
-            "UPDATE ad_reviews SET reward_cents = ? WHERE reward_cents IS NULL OR reward_cents < 1",
-            (AD_REWARD,),
-        )
-        conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
             "idx_ad_reviews_pending_user "
             "ON ad_reviews(user_id) WHERE status = 'pending'"
