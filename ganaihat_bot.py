@@ -898,6 +898,10 @@ def run_legacy_migration(
                 "message": f"Migration {migration_id} was already completed.",
             }
 
+        # Bridge legacy points → balance_cents before any conversion.
+        backfill_balance_cents_from_points(conn)
+        conn.commit()
+
         # Safety pre-check: scan for negative balances before writing anything
         all_users = conn.execute(
             "SELECT user_id, balance_cents, balance_usd_nano "

@@ -89,7 +89,9 @@ def _create_test_db(path, users=None, smm_orders=None, withdrawals=None):
     if users:
         for uid, cents in users:
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, activation_status) VALUES (?, 'Test', ?, 1)",
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "balance_migrated_at, activation_status) "
+                "VALUES (?, 'Test', ?, CURRENT_TIMESTAMP, 1)",
                 (uid, cents),
             )
     if smm_orders:

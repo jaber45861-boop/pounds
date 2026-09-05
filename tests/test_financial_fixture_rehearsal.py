@@ -112,15 +112,17 @@ def _create_fixture_db(path: str, *, include_negative=False, include_premigrated
     for i, cents in enumerate(FIXTURE_BALANCES):
         uid = 8001 + i
         conn.execute(
-            "INSERT INTO users (user_id, first_name, balance_cents, activation_status) "
-            "VALUES (?, ?, ?, 1)",
+            "INSERT INTO users (user_id, first_name, balance_cents, "
+            "balance_migrated_at, activation_status) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP, 1)",
             (uid, f"Fixture{i}", cents),
         )
 
     if include_negative:
         conn.execute(
-            "INSERT INTO users (user_id, first_name, balance_cents, activation_status) "
-            "VALUES (?, ?, ?, 1)",
+            "INSERT INTO users (user_id, first_name, balance_cents, "
+            "balance_migrated_at, activation_status) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP, 1)",
             (NEGATIVE_USER_ID, "NegativeUser", -100),
         )
 
@@ -718,7 +720,9 @@ class TestHistoricalDataPreservation(unittest.TestCase):
         conn = sqlite3.connect(db)
         conn.execute("""CREATE TABLE users (
             user_id INTEGER PRIMARY KEY, first_name TEXT NOT NULL,
+            points INTEGER DEFAULT 0,
             balance_cents INTEGER NOT NULL DEFAULT 0,
+            balance_migrated_at DATETIME,
             balance_usd_nano INTEGER NOT NULL DEFAULT 0,
             activation_status INTEGER NOT NULL DEFAULT 0
         )""")

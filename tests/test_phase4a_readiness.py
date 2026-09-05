@@ -120,7 +120,9 @@ def _create_test_db(path, users=None):
     if users:
         for uid, cents in users:
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, activation_status) VALUES (?, 'Test', ?, 1)",
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "balance_migrated_at, activation_status) "
+                "VALUES (?, 'Test', ?, CURRENT_TIMESTAMP, 1)",
                 (uid, cents),
             )
     conn.execute("INSERT OR IGNORE INTO service_price_settings (service_key, price_points, price_cents) VALUES ('test_svc', 1000, 1000)")
@@ -917,8 +919,9 @@ def _create_db_without_column(path, users=None, omit_column=None):
     if users:
         for uid, cents in users:
             conn.execute(
-                "INSERT INTO users (user_id, first_name, balance_cents, activation_status) "
-                "VALUES (?, 'Test', ?, 1)",
+                "INSERT INTO users (user_id, first_name, balance_cents, "
+                "balance_migrated_at, activation_status) "
+                "VALUES (?, 'Test', ?, CURRENT_TIMESTAMP, 1)",
                 (uid, cents),
             )
     conn.execute(
