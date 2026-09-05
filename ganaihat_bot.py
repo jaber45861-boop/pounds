@@ -1845,10 +1845,6 @@ def init_db():
                 "(service_key, price_points, price_cents) VALUES (?, ?, ?)",
                 (service_key, service["cost"], service["cost"]),
             )
-        conn.execute(
-            "UPDATE service_price_settings SET price_cents = price_points "
-            "WHERE price_cents IS NULL"
-        )
         for service_key, service in SERVICE_INDEX.items():
             conn.execute(
                 "INSERT OR IGNORE INTO service_quantity_settings "
@@ -1922,10 +1918,6 @@ def init_db():
             conn.execute(
                 "ALTER TABLE referral_tasks ADD COLUMN amount_cents INTEGER"
             )
-        conn.execute(
-            "UPDATE referral_tasks SET amount_cents = points_spent "
-            "WHERE amount_cents IS NULL"
-        )
         # طلبات تنفيذ المهام المدفوعة: لا تُصرف المكافأة قبل موافقة العميل.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS referral_task_claims (
@@ -2111,10 +2103,6 @@ def init_db():
             conn.execute(
                 "ALTER TABLE withdrawal_requests ADD COLUMN amount_cents INTEGER"
             )
-        conn.execute(
-            "UPDATE withdrawal_requests SET amount_cents = points_amount "
-            "WHERE amount_cents IS NULL"
-        )
         # V2 withdrawal fields (USDT-based accounting)
         for col_sql in [
             "ALTER TABLE withdrawal_requests ADD COLUMN method_code TEXT",
@@ -2174,10 +2162,6 @@ def init_db():
                 "ALTER TABLE promoted_channel_campaigns "
                 "ADD COLUMN amount_cents INTEGER"
             )
-        conn.execute(
-            "UPDATE promoted_channel_campaigns SET amount_cents = points_cost "
-            "WHERE amount_cents IS NULL"
-        )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
             "idx_promoted_channel_active "
