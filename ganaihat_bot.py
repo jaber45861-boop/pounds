@@ -1660,7 +1660,8 @@ def init_db():
                 joined_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
                 points       INTEGER  DEFAULT 0,
                 referred_by  INTEGER  REFERENCES users(user_id),
-                activation_status INTEGER NOT NULL DEFAULT 0
+                activation_status INTEGER NOT NULL DEFAULT 0,
+                balance_usd_nano   INTEGER NOT NULL DEFAULT 0
             )
         """)
         # ترقية قواعد البيانات القديمة دون حذف المستخدمين أو النقاط.
@@ -1691,6 +1692,11 @@ def init_db():
         if "fraud_marked_at" not in user_columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN fraud_marked_at DATETIME"
+            )
+        if "balance_usd_nano" not in user_columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN balance_usd_nano INTEGER "
+                "NOT NULL DEFAULT 0"
             )
         if "balance_cents" not in user_columns:
             conn.execute(
@@ -1806,10 +1812,6 @@ def init_db():
             conn.execute(
                 "ALTER TABLE smm_orders ADD COLUMN amount_cents INTEGER"
             )
-        conn.execute(
-            "UPDATE smm_orders SET amount_cents = points_spent "
-            "WHERE amount_cents IS NULL"
-        )
         # جدول الأسعار القابلة للتعديل لكل خدمة. تبقى تكلفة الخدمة الفعلية
         # مستقلة عن حد الإعلان العام البالغ 100 نقطة.
         conn.execute("""

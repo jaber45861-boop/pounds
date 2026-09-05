@@ -83,8 +83,8 @@ class TestInitDbNoFinancialSchema(unittest.TestCase):
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
-    def test_init_db_does_not_create_balance_usd_nano(self):
-        """TEST A: init_db() must NOT create balance_usd_nano column."""
+    def test_init_db_creates_balance_usd_nano(self):
+        """TEST A: init_db() must create balance_usd_nano in the fresh schema."""
         # Patch get_connection to use our test database
         def _test_conn():
             c = sqlite3.connect(self._db_path)
@@ -96,9 +96,9 @@ class TestInitDbNoFinancialSchema(unittest.TestCase):
         try:
             init_db()
             conn = sqlite3.connect(self._db_path)
-            self.assertFalse(
+            self.assertTrue(
                 _column_exists(conn, "users", "balance_usd_nano"),
-                "init_db() should NOT create users.balance_usd_nano"
+                "init_db() should create users.balance_usd_nano in fresh schema"
             )
             conn.close()
         finally:
