@@ -2257,7 +2257,6 @@ def init_db():
         conn.commit()
     refresh_promotion_packages()
     refresh_required_channels()
-    release_pending_referrals_for_activated_users()
 
 
 def normalize_channel_input(value: str) -> str | None:
