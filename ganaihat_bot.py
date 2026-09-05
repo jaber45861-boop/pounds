@@ -124,6 +124,9 @@ CPAGRIP_USER_ID         = os.environ.get("CPAGRIP_USER_ID", "")
 CPAGRIP_KEY             = os.environ.get("CPAGRIP_KEY", "")
 CPAGRIP_RSS_URL         = "https://www.cpagrip.com/common/offer_feed_rss.php"
 
+# ─── إعدادات CPAlead (طريق الإبلاغ عن التحويلات) ──────────────────────────────
+CPALEAD_POSTBACK_PASSWORD = os.environ.get("CPALEAD_POSTBACK_PASSWORD", "")
+
 REFERRAL_SERVICE_KEY = "referral_boost"
 REFERRAL_COST = 500
 REFERRAL_QUANTITY = 25
@@ -2218,6 +2221,20 @@ def init_db():
             )
         """)
         
+        # ─── جدول تحويلات CPAlead ─────────────────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cpalead_conversions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                subid           TEXT    NOT NULL,
+                lead_id         TEXT    NOT NULL UNIQUE,
+                campaign_id     TEXT    NOT NULL,
+                campaign_name   TEXT    NOT NULL DEFAULT '',
+                payout          TEXT    NOT NULL,
+                credit_status   TEXT    NOT NULL DEFAULT 'not_credited',
+                received_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # ─── جدول منع تكرار المعاملات (Idempotency) ──────────────────────────
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_transactions (
@@ -10234,6 +10251,7 @@ def run_bot():
         cpagrip_user_id=CPAGRIP_USER_ID,
         cpagrip_key=CPAGRIP_KEY,
         cpagrip_rss_url=CPAGRIP_RSS_URL,
+        cpalead_postback_password=CPALEAD_POSTBACK_PASSWORD,
     )
     if not API_SECRET:
         logging.getLogger("telegram_reward_api").warning(

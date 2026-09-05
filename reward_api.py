@@ -19,7 +19,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
@@ -215,6 +215,7 @@ def register_reward_api(
     cpagrip_user_id: str = "",
     cpagrip_key: str = "",
     cpagrip_rss_url: str = "https://www.cpagrip.com/common/offer_feed_rss.php",
+    cpalead_postback_password: str = "",
 ):
     """Register Flask routes for the Mini App reward API."""
     global _live_egp_per_usd
@@ -640,6 +641,78 @@ def register_reward_api(
             "status": "not_implemented",
             "message": "Lead Checker integration pending real response format",
         }), 501
+
+    # ─── CPAlead Postback Endpoint ───────────────────────────────────────────
+
+    @app.route("/api/cpalead/postback", methods=["GET", "POST"])
+    def api_cpalead_postback():
+        """Receive CPAlead conversion postback callbacks.
+
+        Accepts CPAlead postback parameters (subid, lead_id, campaign_id,
+        campaign_name, payout, password), validates authentication and fields,
+        and persists an immutable conversion record.
+
+        This endpoint does NOT credit any wallet. Recording only.
+        """
+        # --- Authentication ---
+        if not cpalead_postback_password:
+            logger.warning("cpalead/postback: CPALEAD_POSTBACK_PASSWORD not configured")
+            return jsonify({"status": "error", "message": "service_not_configured"}), 503
+
+        # CPAlead sends parameters as query-string GET params or form POST
+        data = request.args if request.method == "GET" else (request.form or request.json or {})
+
+        provided_password = data.get("password", "")
+        if not hmac.compare_digest(provided_password, cpalead_postback_password):
+            return jsonify({"status": "error", "message": "authentication_failed"}), 403
+
+        # --- Field validation ---
+        subid = (data.get("subid") or "").strip()
+        lead_id = (data.get("lead_id") or "").strip()
+        campaign_id = (data.get("campaign_id") or "").strip()
+        campaign_name = (data.get("campaign_name") or "").strip()
+        payout_raw = (data.get("payout") or "").strip()
+
+        if not subid:
+            return jsonify({"status": "error", "message": "missing_subid"}), 400
+        if not lead_id:
+            return jsonify({"status": "error", "message": "missing_lead_id"}), 400
+        if not campaign_id:
+            return jsonify({"status": "error", "message": "missing_campaign_id"}), 400
+        if not payout_raw:
+            return jsonify({"status": "error", "message": "missing_payout"}), 400
+
+        # --- Payout validation (Decimal only, no float) ---
+        try:
+            payout_decimal = Decimal(payout_raw)
+        except (InvalidOperation, ValueError):
+            return jsonify({"status": "error", "message": "invalid_payout"}), 400
+
+        if payout_decimal.is_nan() or payout_decimal.is_infinite():
+            return jsonify({"status": "error", "message": "invalid_payout"}), 400
+        if payout_decimal < 0:
+            return jsonify({"status": "error", "message": "negative_payout"}), 400
+
+        payout_normalized = str(payout_decimal)
+
+        # --- Persist conversion record ---
+        try:
+            conn = get_connection()
+            with conn:
+                conn.execute(
+                    "INSERT INTO cpalead_conversions "
+                    "(subid, lead_id, campaign_id, campaign_name, payout) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (subid, lead_id, campaign_id, campaign_name, payout_normalized),
+                )
+        except sqlite3.IntegrityError:
+            # Duplicate lead_id — idempotent: return success
+            return jsonify({"status": "ok", "message": "duplicate_ignored"})
+        except sqlite3.Error as exc:
+            logger.error("cpalead/postback DB error: %s", exc)
+            return jsonify({"status": "error", "message": "db_error"}), 500
+
+        return jsonify({"status": "ok", "message": "recorded"})
 
     def _authenticate_user():
         """Extract user_id from session cookie or header."""
